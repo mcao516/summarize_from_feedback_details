@@ -409,6 +409,7 @@ if __name__ == "__main__":
                 accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}")
 
     if args.run_eval:
+        accelerator.print("===evaluating model===")
         for eval_split in eval_dataloaders:
             eval_df, rouge_scores, all_eval_losses = evaluate(
                 args, accelerator, tokenizer, model, eval_dataloaders[eval_split], generation_config
@@ -426,6 +427,7 @@ if __name__ == "__main__":
 
     # save model
     if args.output_dir and args.num_train_epochs > 0:
+        accelerator.print("===saving model===")
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
