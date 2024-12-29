@@ -290,6 +290,7 @@ def get_reward(model, query_responses, tokenizer, context_length):
         return_dict=True,
         output_hidden_states=True,
     )
+    # reward_logits: [batch_size, query_responses_len, 1]
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     return (
@@ -371,7 +372,7 @@ def forward(model, query_responses, tokenizer):
 def evaluate(reward_model, policy, tokenizer, dataloader, generation_config, sampling=True):
     eval_storage = defaultdict(list)
     with torch.no_grad():
-        for data in tqdm(dataloader):
+        for data in tqdm(dataloader, disable=sampling):
             queries = data["query_token"]
             reference_response_token = data["reference_response_token"]
             context_length = queries.shape[1]
@@ -606,6 +607,8 @@ if __name__ == "__main__":
             sequence_lengths = []
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
+                # query: [local_rollout_forward_batch_size, max_query_len]
+                # query_response: [local_rollout_forward_batch_size, max_query_len + response_len]
                 query_response, logits = generate(
                     accelerator.unwrap_model(model).policy,
                     query,
@@ -619,7 +622,7 @@ if __name__ == "__main__":
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                 del logits, all_logprob
                 torch.cuda.empty_cache()
-
+                # ref_logprob: [local_rollout_forward_batch_size, response_len]
                 ref_output = forward(ref_policy, query_response, tokenizer)
                 ref_logits = ref_output.logits[:, context_length - 1 : -1]
                 ref_logits /= args.temperature + 1e-7
@@ -634,11 +637,13 @@ if __name__ == "__main__":
                 # Response Processing 2. run reward model on the truncated responses
                 postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
-                full_value, _, _ = get_reward(
-                    accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
-                )
-                value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
+                # query_response: [local_rollout_forward_batch_size, max_query_len + response_len]
+                with torch.no_grad():
+                    full_value, _, _ = get_reward(
+                        accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
+                    )
+                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
 
                 query_responses.append(query_response)
                 responses.append(response)
@@ -677,7 +682,7 @@ if __name__ == "__main__":
             values = torch.masked_fill(values, padding_mask_p1, 0)
 
             # 4. compute rewards
-            kl = logprobs - ref_logprobs
+            kl = logprobs - ref_logprobs  # [batch_size, response_length]
             non_score_reward = -args.ppo.kl_coef * kl
             rewards = non_score_reward.clone()
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
