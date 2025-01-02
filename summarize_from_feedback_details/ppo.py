@@ -279,7 +279,16 @@ class ScalarModel(PreTrainedModel):
         return reward
 
 
-def get_reward(model, query_responses, tokenizer, context_length):
+def get_reward(model, query_responses, tokenizer, context_length, use_dense_rewards=False):
+    """
+    Args:
+        query_responses: [curr_batch_size, query_responses_len]
+
+    Returns:
+        reward_logits: [curr_batch_size, query_responses_len, 1]
+        score: [curr_batch_size]
+        sequence_lengths: [curr_batch_size]
+    """
     attention_mask = query_responses != tokenizer.pad_token_id
     # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
@@ -293,11 +302,33 @@ def get_reward(model, query_responses, tokenizer, context_length):
     # reward_logits: [batch_size, query_responses_len, 1]
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return (
-        reward_logits,
-        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
-        sequence_lengths,
-    )
+    if use_dense_rewards:
+        seq_level_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
+        # response_lengths = sequence_lengths - context_length
+        actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
+        response_lengths = sequence_lengths - context_length
+        response_lengths_p1 = response_lengths + 1
+        actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
+
+        dense_rewards = torch.zeros_like(
+            query_responses[:, context_length:],
+            dtype=reward_logits.dtype,
+            device=reward_logits.device
+        )
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, -1))
+
+        return (
+            dense_rewards,
+            seq_level_rewards,
+            sequence_lengths,
+        )
+    else:
+        return (
+            reward_logits,
+            reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
+            sequence_lengths,
+        )
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -604,6 +635,7 @@ if __name__ == "__main__":
             ref_logprobs = []
             values = []
             scores = []
+            dense_scores = []
             sequence_lengths = []
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
@@ -643,7 +675,15 @@ if __name__ == "__main__":
                         accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
                     )
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                    _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
+                    # score: [local_rollout_forward_batch_size]
+                    # _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
+                    dense_score, score, _ = get_reward(
+                        reward_model,
+                        postprocessed_query_response,
+                        tokenizer,
+                        context_length,
+                        use_dense_rewards=True
+                    )
 
                 query_responses.append(query_response)
                 responses.append(response)
@@ -653,6 +693,7 @@ if __name__ == "__main__":
                 values.append(value)
                 sequence_lengths.append(sequence_length)
                 scores.append(score)
+                dense_scores.append(dense_score)
             query_responses = torch.cat(query_responses, 0)
             responses = torch.cat(responses, 0)
             postprocessed_responses = torch.cat(postprocessed_responses, 0)
@@ -661,6 +702,7 @@ if __name__ == "__main__":
             values = torch.cat(values, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
+            dense_scores = torch.cat(dense_scores, 0)
             del (logprob, ref_logprob, full_value, value, score)
             torch.cuda.empty_cache()
 
@@ -686,8 +728,12 @@ if __name__ == "__main__":
             non_score_reward = -args.ppo.kl_coef * kl
             rewards = non_score_reward.clone()
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
+            # sequence_lengths_p1: index of the first padding token
+            # sequence_lengths: index of the first EOS token
             actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
-            rewards[[actual_start, actual_end]] += scores
+            # rewards_ = rewards + dense_scores
+            # rewards[[actual_start, actual_end]] += scores
+            rewards += dense_scores
 
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
