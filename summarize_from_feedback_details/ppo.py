@@ -32,6 +32,7 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+from summarize_from_feedback_details.shap_reward import get_shap_reward
 
 torch.set_printoptions(precision=4, sci_mode=False)
 api = HfApi()
@@ -303,6 +304,37 @@ def get_reward(model, query_responses, tokenizer, context_length, use_dense_rewa
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     if use_dense_rewards:
+        response_lengths = sequence_lengths - context_length
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = np.zeros((query_responses.size(0), response_max_length))
+        for i in range(query_responses.size(0)):
+            try:
+                shap_values = get_shap_reward(model, query_responses[i], tokenizer, context_length).values
+                m = shap_values.shape[1]  # Length of the current array
+                assert response_lengths[i] + 1 == m, f"{response_lengths[i] + 1} : {m}"
+                if m > response_max_length:
+                    raise ValueError(f"Array at index {i} has length {m} greater than the target length {response_max_length}.")
+                dense_rewards[i, :m] = shap_values
+            except ValueError as v:
+                print(v)
+            except Exception as e:
+                print("SHAP Exception: ", e)
+        dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)
+
+        # deal with over-length response
+        response_lengths_p1 = response_lengths + 1
+        actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
+        actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+        seq_level_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
+        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, -1))
+
+        return (
+            dense_rewards,
+            seq_level_rewards,
+            sequence_lengths,
+        )
+    elif False:
         seq_level_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
         # response_lengths = sequence_lengths - context_length
         actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
