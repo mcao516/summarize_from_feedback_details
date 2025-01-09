@@ -157,6 +157,10 @@ class Args:
     """the url of the saved model in the Hugging Face Hub (will be autoset)"""
     output_dir: str = "models/ppo_model"
     """Where to save the model"""
+
+    # mine
+    use_dense_rewards: bool = False
+    """whether to use dense rewards"""
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
@@ -280,7 +284,7 @@ class ScalarModel(PreTrainedModel):
         return reward
 
 
-def get_reward(model, query_responses, tokenizer, context_length, use_dense_rewards=False):
+def get_reward(model, query_responses, tokenizer, context_length, reward_type="sparse"):
     """
     Args:
         query_responses: [curr_batch_size, query_responses_len]
@@ -303,7 +307,7 @@ def get_reward(model, query_responses, tokenizer, context_length, use_dense_rewa
     # reward_logits: [batch_size, query_responses_len, 1]
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    if use_dense_rewards:
+    if reward_type == "shap_token":
         response_lengths = sequence_lengths - context_length
         response_max_length = query_responses.size(1) - context_length
         dense_rewards = np.zeros((query_responses.size(0), response_max_length))
@@ -311,12 +315,12 @@ def get_reward(model, query_responses, tokenizer, context_length, use_dense_rewa
             try:
                 shap_values = get_shap_reward(model, query_responses[i], tokenizer, context_length).values
                 m = shap_values.shape[1]  # Length of the current array
-                assert response_lengths[i] + 1 == m, f"{response_lengths[i] + 1} : {m}"
-                if m > response_max_length:
-                    raise ValueError(f"Array at index {i} has length {m} greater than the target length {response_max_length}.")
+                # assert response_lengths[i] + 1 == m, f"{response_lengths[i] + 1} : {m}"
+                # if m > response_max_length:
+                #     raise ValueError(f"Array at index {i} has length {m} greater than the target length {response_max_length}.")
                 dense_rewards[i, :m] = shap_values
             except ValueError as v:
-                print(v)
+                print("SHAP Value Error: ", v)
             except Exception as e:
                 print("SHAP Exception: ", e)
         dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)
@@ -327,14 +331,15 @@ def get_reward(model, query_responses, tokenizer, context_length, use_dense_rewa
         actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
         contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
         seq_level_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
-        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, -1))
+        zeros = torch.zeros_like(seq_level_rewards)
+        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, zeros, torch.full_like(zeros, -1))
 
         return (
             dense_rewards,
             seq_level_rewards,
             sequence_lengths,
         )
-    elif False:
+    elif reward_type == "dummy_dense":
         seq_level_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
         # response_lengths = sequence_lengths - context_length
         actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
@@ -355,7 +360,7 @@ def get_reward(model, query_responses, tokenizer, context_length, use_dense_rewa
             seq_level_rewards,
             sequence_lengths,
         )
-    else:
+    elif reward_type == "sparse":
         return (
             reward_logits,
             reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
@@ -647,6 +652,7 @@ if __name__ == "__main__":
                 tokenizer,
                 eval_dataloaders[eval_split],
                 validation_generation_config,
+                sampling=True,
             )
             validation_score = eval_storage["score"][0]
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
@@ -714,7 +720,7 @@ if __name__ == "__main__":
                         postprocessed_query_response,
                         tokenizer,
                         context_length,
-                        use_dense_rewards=True
+                        reward_type="sparse",
                     )
 
                 query_responses.append(query_response)
@@ -764,8 +770,10 @@ if __name__ == "__main__":
             # sequence_lengths: index of the first EOS token
             actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
             # rewards_ = rewards + dense_scores
-            # rewards[[actual_start, actual_end]] += scores
-            rewards += dense_scores
+            if args.use_dense_rewards:
+                rewards += dense_scores
+            else:
+                rewards[[actual_start, actual_end]] += scores
 
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
