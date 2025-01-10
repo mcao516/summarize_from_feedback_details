@@ -32,7 +32,9 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
-from summarize_from_feedback_details.shap_reward import get_shap_reward
+import shap
+from summarize_from_feedback_details.shap_reward import get_shap_rewards
+from summarize_from_feedback_details.shap_reward import parse_sentence
 
 torch.set_printoptions(precision=4, sci_mode=False)
 api = HfApi()
@@ -161,6 +163,8 @@ class Args:
     # mine
     use_dense_rewards: bool = False
     """whether to use dense rewards"""
+    reward_type: str = "span_shap"
+    """Reward type"""
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
@@ -307,13 +311,13 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
     # reward_logits: [batch_size, query_responses_len, 1]
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    if reward_type == "shap_token":
+    if reward_type == "token_shap":
         response_lengths = sequence_lengths - context_length
         response_max_length = query_responses.size(1) - context_length
         dense_rewards = np.zeros((query_responses.size(0), response_max_length))
         for i in range(query_responses.size(0)):
             try:
-                shap_values = get_shap_reward(model, query_responses[i], tokenizer, context_length).values
+                shap_values = get_shap_rewards(model, query_responses[i], tokenizer, context_length).values
                 m = shap_values.shape[1]  # Length of the current array
                 # assert response_lengths[i] + 1 == m, f"{response_lengths[i] + 1} : {m}"
                 # if m > response_max_length:
@@ -327,12 +331,52 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
 
         # deal with over-length response
         response_lengths_p1 = response_lengths + 1
-        actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
-        actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
         contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
         seq_level_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
-        zeros = torch.zeros_like(seq_level_rewards)
-        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, zeros, torch.full_like(zeros, -1))
+        actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
+        actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
+        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, -1))
+
+        return (
+            dense_rewards,
+            seq_level_rewards,
+            sequence_lengths,
+        )
+    elif reward_type == "span_shap":
+        response_lengths = sequence_lengths - context_length
+        dense_rewards = np.zeros((query_responses.size(0), query_responses.size(1) - context_length))
+        for i in range(query_responses.size(0)):
+            try:
+                shap_outputs = get_shap_rewards(
+                    model,
+                    query_responses[i],
+                    tokenizer,
+                    context_length,
+                    masker=shap.maskers.Text(parse_sentence, mask_token=" ", collapse_mask_token=True)
+                )
+                shap_values, shap_data = shap_outputs.values, shap_outputs.data
+
+                idx = -1
+                for j in range(shap_values.shape[1]):
+                    idx += len(tokenizer.encode(shap_data[0][j]))
+                    if idx >= dense_rewards.shape[1]:
+                        print("idx: {}; dense_rewards.size(1): {}".format(idx, dense_rewards.shape[1]))
+                        dense_rewards[i, -1] = shap_values[0][j]
+                    else:
+                        dense_rewards[i, idx] = shap_values[0][j]
+                # print("idx: {}; real size: {}".format(idx, response_lengths[i]))
+            except ValueError as ve:
+                print(ve)
+        dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)
+
+        # deal with over-length response
+        response_lengths_p1 = response_lengths + 1
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+        seq_level_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
+        # zeros = torch.zeros_like(seq_level_rewards)
+        actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
+        actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
+        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, -1))
 
         return (
             dense_rewards,
@@ -366,6 +410,8 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
             sequence_lengths,
         )
+    else:
+        raise ValueError(f"Unknown reward type: {reward_type}")
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -720,7 +766,7 @@ if __name__ == "__main__":
                         postprocessed_query_response,
                         tokenizer,
                         context_length,
-                        reward_type="sparse",
+                        reward_type=args.reward_type,
                     )
 
                 query_responses.append(query_response)
