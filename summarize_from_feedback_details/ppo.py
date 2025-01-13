@@ -33,8 +33,8 @@ from transformers import (
     PreTrainedModel,
 )
 import shap
-from summarize_from_feedback_details.shap_reward import get_shap_rewards
-from summarize_from_feedback_details.shap_reward import parse_sentence
+from summarize_from_feedback_details.shap_reward import parse_sentence, get_shap_rewards
+from summarize_from_feedback_details.attr_reward import get_attr_rewards
 
 torch.set_printoptions(precision=4, sci_mode=False)
 api = HfApi()
@@ -288,7 +288,7 @@ class ScalarModel(PreTrainedModel):
         return reward
 
 
-def get_reward(model, query_responses, tokenizer, context_length, reward_type="sparse"):
+def get_reward(model, query_responses, tokenizer, context_length, reward_type="sparse", no_eos_penalty=-1):
     """
     Args:
         query_responses: [curr_batch_size, query_responses_len]
@@ -335,7 +335,9 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
         seq_level_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
         actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
         actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
-        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, -1))
+        dense_rewards[[actual_start, actual_end]] = torch.where(
+            contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, no_eos_penalty)
+        )
 
         return (
             dense_rewards,
@@ -376,7 +378,9 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
         # zeros = torch.zeros_like(seq_level_rewards)
         actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
         actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
-        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, -1))
+        dense_rewards[[actual_start, actual_end]] = torch.where(
+            contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, no_eos_penalty)
+        )
 
         return (
             dense_rewards,
@@ -397,7 +401,9 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             device=reward_logits.device
         )
         contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
-        dense_rewards[[actual_start, actual_end]] = torch.where(contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, -1))
+        dense_rewards[[actual_start, actual_end]] = torch.where(
+            contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, no_eos_penalty)
+        )
 
         return (
             dense_rewards,
@@ -408,6 +414,48 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
         return (
             reward_logits,
             reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
+            sequence_lengths,
+        )
+    elif reward_type == "attr_lig":
+        response_lengths = sequence_lengths - context_length
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = torch.zeros((query_responses.size(0), response_max_length),
+                                    device=reward_logits.device, dtype=reward_logits.dtype)
+        for i in range(query_responses.size(0)):
+            try:
+                attr_scores = get_attr_rewards(
+                    model,
+                    query_responses[i],
+                    tokenizer, context_length,
+                    n_steps=100,
+                    internal_batch_size=20,
+                )
+                assert attr_scores.shape[0] == response_max_length
+                dense_rewards[i, :] = attr_scores
+            except Exception as e:
+                print("Attr Exception: ", e)
+        # dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)
+
+        # deal with over-length response
+        response_lengths_p1 = response_lengths + 1
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+        seq_rewards = reward_logits[
+            torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths
+        ].squeeze(-1)
+
+        actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
+        actual_end = torch.where(
+            response_lengths_p1 < query_responses.size(1) - context_length,
+            response_lengths_p1,
+            response_lengths
+        )
+        dense_rewards[[actual_start, actual_end]] = torch.where(
+            contain_eos_token, seq_rewards, torch.full_like(seq_rewards, no_eos_penalty)
+        )
+
+        return (
+            dense_rewards,
+            seq_rewards,
             sequence_lengths,
         )
     else:
