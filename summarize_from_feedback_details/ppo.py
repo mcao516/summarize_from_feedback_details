@@ -495,6 +495,8 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             redist_reward = torch.tensor(
                 get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attention), 
                 device=reward_logits.device)
+            print("redist_reward", redist_reward.shape)
+            print("response_max_length", response_max_length)
             assert redist_reward.shape[0] == response_max_length
             dense_rewards[i, :] = redist_reward
         # dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)
