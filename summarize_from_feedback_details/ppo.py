@@ -316,6 +316,7 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
         # position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
+        output_attentions=True,
     )
     # reward_logits: [batch_size, query_responses_len, 1]
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
