@@ -490,9 +490,10 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             #     out = model(**inputs)
             # attentions = out.attentions[-1].mean(1)
             attention = attentions[i]
+            attention = attention.squeeze().cpu().detach().numpy(upcast=True, downcast=False)
 
             redist_reward = torch.tensor(
-                get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attention.cpu()), 
+                get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attention), 
                 device=reward_logits.device)
             assert redist_reward.shape[0] == response_max_length
             dense_rewards[i, :] = redist_reward
