@@ -16,7 +16,10 @@ def get_attention_distribution(
         torch.Tensor: The attention distribution.
 
     """
-    attention = attention.squeeze().cpu().detach().numpy()
+    if attention.dtype == torch.bfloat16:
+        attention = attention.float()
+
+    attention = attention.detach().squeeze().cpu().numpy()
     attention_matrix = attention[
         len(query) : len(query) + len(response),
         len(query) : len(query) + len(response),
