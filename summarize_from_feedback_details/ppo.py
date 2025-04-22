@@ -490,7 +490,7 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             #     out = model(**inputs)
             # attentions = out.attentions[-1].mean(1)
             attention = attentions[i]
-            attention = attention.squeeze().float().cpu().detach().numpy()
+            # attention = attention.squeeze().float().detach().numpy()
 
             redist_reward = torch.tensor(
                 get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attention), 
