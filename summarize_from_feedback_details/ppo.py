@@ -35,6 +35,10 @@ from transformers import (
 import shap
 from summarize_from_feedback_details.shap_reward import parse_sentence, get_shap_rewards
 from summarize_from_feedback_details.attr_reward import get_attr_rewards
+from abcrl.attention.redistribution import (
+    get_attention_distribution,
+    get_generator_attention_distribution,
+)
 
 torch.set_printoptions(precision=4, sci_mode=False)
 api = HfApi()
@@ -143,7 +147,7 @@ class Args:
     # wandb and HF tracking configs
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "tldr_summarize"
+    wandb_project_name: str = "tldr_ensemble"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -458,6 +462,56 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             seq_rewards,
             sequence_lengths,
         )
+    elif reward_type == "abc":
+        response_lengths = sequence_lengths - context_length
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = torch.zeros((query_responses.size(0), response_max_length),
+                                    device=reward_logits.device, dtype=reward_logits.dtype)
+        for i in range(query_responses.size(0)):
+            with torch.no_grad():
+                inputs = tokenizer(
+                    query_responses[i],
+                    return_tensors="pt",
+                    max_length=512,
+                    padding="max_length",
+                    truncation=True,
+                ).to("cuda:0")
+
+                out = model(**inputs)
+            attentions = out.attentions[-1].mean(1)
+
+
+            try:
+                redist_reward = torch.tensor(get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attentions.cpu()), device=reward.device)
+                assert redist_reward.shape[0] == response_max_length
+                dense_rewards[i, :] = redist_reward
+            except Exception as e:
+                print("ABC Exception: ", e)
+        # dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)
+
+        # deal with over-length response
+        response_lengths_p1 = response_lengths + 1
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+        seq_rewards = reward_logits[
+            torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths
+        ].squeeze(-1)
+
+        actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
+        actual_end = torch.where(
+            response_lengths_p1 < query_responses.size(1) - context_length,
+            response_lengths_p1,
+            response_lengths
+        )
+        dense_rewards[[actual_start, actual_end]] = torch.where(
+            contain_eos_token, seq_rewards, torch.full_like(seq_rewards, no_eos_penalty)
+        )
+
+        return (
+            dense_rewards,
+            seq_rewards,
+            sequence_lengths,
+        )
+
     else:
         raise ValueError(f"Unknown reward type: {reward_type}")
 
