@@ -491,14 +491,11 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             # attentions = out.attentions[-1].mean(1)
             attention = attentions[i]
 
-            try:
-                redist_reward = torch.tensor(
-                    get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attention.cpu()), 
-                    device=attentions.device)
-                assert redist_reward.shape[0] == response_max_length
-                dense_rewards[i, :] = redist_reward
-            except Exception as e:
-                print("ABC Exception: ", e)
+            redist_reward = torch.tensor(
+                get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attention.cpu()), 
+                device=reward_logits.device)
+            assert redist_reward.shape[0] == response_max_length
+            dense_rewards[i, :] = redist_reward
         # dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)
 
         # deal with over-length response
