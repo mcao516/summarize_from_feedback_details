@@ -286,6 +286,11 @@ class ScalarModel(PreTrainedModel):
             std=1 / np.sqrt(self.config.hidden_size + 1),
         )
 
+    def forward_with_output(self, **kwargs):
+        output = self.lm_backbone(**kwargs)
+        reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
+        return reward, output
+
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
         reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
@@ -305,7 +310,7 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
     attention_mask = query_responses != tokenizer.pad_token_id
     # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    reward_logits = model(
+    reward_logits, reward_output = model.forward_with_output(
         input_ids=input_ids,
         attention_mask=attention_mask,
         # position_ids=position_ids,
@@ -468,18 +473,19 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
         dense_rewards = torch.zeros((query_responses.size(0), response_max_length),
                                     device=reward_logits.device, dtype=reward_logits.dtype)
         for i in range(query_responses.size(0)):
-            with torch.no_grad():
-                inputs = tokenizer(
-                    query_responses[i],
-                    return_tensors="pt",
-                    max_length=512,
-                    padding="max_length",
-                    truncation=True,
-                ).to("cuda:0")
+            # with torch.no_grad():
+            #     inputs = tokenizer(
+            #         query_responses[i],
+            #         return_tensors="pt",
+            #         max_length=512,
+            #         padding="max_length",
+            #         truncation=True,
+            #     ).to("cuda:0")
 
-                out = model(**inputs)
-            attentions = out.attentions[-1].mean(1)
-
+            #     out = model(**inputs)
+            # attentions = out.attentions[-1].mean(1)
+            attentions = reward_output.attentions[-1].mean(1)
+            print("Attentions shape:", attentions.shape)
 
             try:
                 redist_reward = torch.tensor(get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attentions.cpu()), device=reward.device)
