@@ -377,7 +377,7 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
                     sents = "".join(shap_data[0][:n])
                     idx = len(tokenizer.encode(sents)) - 1
 
-                    if idx > len(dense_rewards) - 1:
+                    if idx > len(dense_rewards[i]) - 1:
                         print("idx: {}; dense_rewards: {}".format(idx, len(dense_rewards)))
                         dense_rewards[i, -1] = shap_values[n-1]
                     else:
