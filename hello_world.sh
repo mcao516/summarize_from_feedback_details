@@ -7,8 +7,8 @@ SEED=1
 if [ -z "$MODEL" ]; then
     # MODEL=EleutherAI/pythia-6.9b-deduped
     # MODEL=EleutherAI/pythia-2.8b-deduped
-    # MODEL=EleutherAI/pythia-1b-deduped
-    MODEL=EleutherAI/pythia-410m-deduped
+    MODEL=EleutherAI/pythia-1b-deduped
+    # MODEL=EleutherAI/pythia-410m-deduped
 fi
 LR=3e-6
 REWARD_MODEL_PATH=models/$MODEL/reward_model_$SEED

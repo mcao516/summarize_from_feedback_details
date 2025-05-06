@@ -147,7 +147,7 @@ class Args:
     # wandb and HF tracking configs
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "tldr_ensemble"
+    wandb_project_name: str = "tldr_ensemble_1b"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -475,7 +475,7 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
                                     device=reward_logits.device, dtype=reward_logits.dtype)
 
         attentions = reward_output.attentions[-1].mean(1)
-        print("Attentions shape:", attentions.shape)
+        #print("Attentions shape:", attentions.shape)
 
         for i in range(query_responses.size(0)):
             # with torch.no_grad():
@@ -493,10 +493,10 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             # attention = attention.squeeze().float().detach().numpy()
 
             redist_reward = torch.tensor(
-                get_attention_distribution(query_responses[i, :context_length], query_responses[i, context_length:], attention), 
-                device=reward_logits.device)
-            print("redist_reward", redist_reward.shape)
-            print("response_max_length", response_max_length)
+                get_attention_distribution(query_responses[i, context_length:], query_responses[i, :context_length], attention), 
+                device=reward_logits.device) * reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)[i]
+            #print("redist_reward", redist_reward.shape)
+            #print("response_max_length", response_max_length)
             assert redist_reward.shape[0] == response_max_length
             dense_rewards[i, :] = redist_reward
         # dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)

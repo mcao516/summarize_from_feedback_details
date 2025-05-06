@@ -7,13 +7,13 @@ SEED=1
 if [ -z "$MODEL" ]; then
     # MODEL=EleutherAI/pythia-6.9b-deduped
     # MODEL=EleutherAI/pythia-2.8b-deduped
-    # MODEL=EleutherAI/pythia-1b-deduped
-    MODEL=EleutherAI/pythia-410m-deduped
+    MODEL=EleutherAI/pythia-1b-deduped
+    # MODEL=EleutherAI/pythia-410m-deduped
 fi
 LR=3e-6
-REWARD_MODEL_PATH=/home/mila/s/shuyuan.zhang/shapley/summarize_from_feedback_details/models/EleutherAI/pythia-410m-deduped/reward_model_$SEED
-SFT_MODEL_PATH=/home/mila/s/shuyuan.zhang/shapley/summarize_from_feedback_details/models/EleutherAI/pythia-410m-deduped/sft_model_$SEED
-POLICY_MODEL_PATH=/home/mila/s/shuyuan.zhang/shapley/summarize_from_feedback_details/models/EleutherAI/pythia-410m-deduped/policy_model_$SEED
+REWARD_MODEL_PATH=/home/mila/s/shuyuan.zhang/shapley/summarize_from_feedback_details/models/EleutherAI/pythia-1b-deduped/reward_model_$SEED
+SFT_MODEL_PATH=/home/mila/s/shuyuan.zhang/shapley/summarize_from_feedback_details/models/EleutherAI/pythia-1b-deduped/sft_model_$SEED
+POLICY_MODEL_PATH=/home/mila/s/shuyuan.zhang/shapley/summarize_from_feedback_details/models/EleutherAI/pythia-1b-deduped/policy_model_$SEED
 
 # vary the following parameters to fit your GPU memory
 local_rollout_forward_batch_size=64 # smaller fits better on GPU
@@ -69,6 +69,6 @@ poetry run accelerate launch --config_file deepspeed.yaml \
       --output_dir=$POLICY_MODEL_PATH \
       --seed=$SEED \
       --print_sample_output_freq=100 \
-      --ppo.kl_coef=0.05 \
+      --ppo.kl_coef=0.13 \
       --use_dense_rewards \
-      --reward_type "attr_lig"
+      --reward_type "span_shap"
