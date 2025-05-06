@@ -169,6 +169,10 @@ class Args:
     """whether to use dense rewards"""
     reward_type: str = "span_shap"
     """Reward type"""
+    sparse_reward_weight: float = 1.0
+    """Weight of sparse rewards"""
+    dense_reward_weight: float = 1.0
+    """Weight of dense rewards"""
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
@@ -383,6 +387,7 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
             except ValueError as ve:
                 print(ve)
         dense_rewards = torch.tensor(dense_rewards, device=reward_logits.device, dtype=reward_logits.dtype)
+        dense_rewards = args.dense_reward_weight * dense_rewards
 
         # deal with over-length response
         response_lengths_p1 = response_lengths + 1
@@ -391,8 +396,10 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
         # zeros = torch.zeros_like(seq_level_rewards)
         actual_start = torch.arange(reward_logits.size(0), device=reward_logits.device)
         actual_end = torch.where(response_lengths_p1 < query_responses.size(1) - context_length, response_lengths_p1, response_lengths)
-        dense_rewards[[actual_start, actual_end]] = torch.where(
-            contain_eos_token, seq_level_rewards, torch.full_like(seq_level_rewards, no_eos_penalty)
+        dense_rewards[[actual_start, actual_end]] += torch.where(
+            contain_eos_token,
+            seq_level_rewards * args.sparse_reward_weight,
+            torch.full_like(seq_level_rewards * args.sparse_reward_weight, no_eos_penalty)
         )
 
         return (
