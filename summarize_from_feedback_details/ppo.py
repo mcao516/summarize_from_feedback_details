@@ -367,15 +367,18 @@ def get_reward(model, query_responses, tokenizer, context_length, reward_type="s
                     masker=shap.maskers.Text(parse_sentence, mask_token=" ", collapse_mask_token=True)
                 )
                 shap_values, shap_data = shap_outputs.values, shap_outputs.data
+                shap_values = np.squeeze(shap_values)
 
-                idx = -1
-                for j in range(shap_values.shape[1]):
-                    idx += len(tokenizer.encode(shap_data[0][j]))
-                    if idx >= dense_rewards.shape[1]:
-                        print("idx: {}; dense_rewards.size(1): {}".format(idx, dense_rewards.shape[1]))
-                        dense_rewards[i, -1] = shap_values[0][j]
+                for n in range(1, len(shap_values) + 1):
+                    sents = "".join(shap_data[0][:n])
+                    idx = len(tokenizer.encode(sents)) - 1
+
+                    if idx > len(dense_rewards) - 1:
+                        print("idx: {}; dense_rewards: {}".format(idx, len(dense_rewards)))
+                        dense_rewards[i, -1] = shap_values[n-1]
                     else:
-                        dense_rewards[i, idx] = shap_values[0][j]
+                        dense_rewards[i, idx] = shap_values[n-1]
+
                 # print("idx: {}; real size: {}".format(idx, response_lengths[i]))
             except ValueError as ve:
                 print(ve)
