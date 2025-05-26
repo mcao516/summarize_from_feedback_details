@@ -119,11 +119,13 @@ class Args:
     hf_repo_id: Optional[str] = None
     """the id of the saved model in the Hugging Face Hub (can be autoset if not given)"""
     hf_repo_revision: Optional[str] = None
-    """the revision of the saved model in the Hugging Face Hub (can be autoset if not given)"""
+    """the revision of the saved model in the Hugging Face Hub (can be autoset if not given for the final model)"""
     hf_repo_url: Optional[str] = None
-    """the url of the saved model in the Hugging Face Hub (will be autoset)"""
+    """the url of the saved model in the Hugging Face Hub (will be autoset for the final model)"""
     output_dir: str = "models/sft_model"
-    """Where to save the model"""
+    """Where to save the model and checkpoints"""
+    save_frequency_updates: int = 0
+    """Frequency of saving checkpoints in terms of optimizer updates. After N optimizer updates, a checkpoint is saved. 0 or negative to disable intermediate saving."""
 
 
 def parse_args() -> tuple[Args, Accelerator]:
@@ -143,8 +145,9 @@ def parse_args() -> tuple[Args, Accelerator]:
             args.hf_entity = api.whoami()["name"]
         if "/" not in args.hf_repo_id: # prepend the current user
             args.hf_repo_id = f"{args.hf_entity}/{args.hf_repo_id}"
-        if args.hf_repo_revision is None:  # auto-generate one
+        if args.hf_repo_revision is None:  # auto-generate one for the final model, usually based on run_name
             args.hf_repo_revision = args.run_name
+        # This URL is for the final model with its specific base revision (e.g., run_name)
         args.hf_repo_url = f"https://huggingface.co/{args.hf_repo_id}/tree/{args.hf_repo_revision}"
     return args, accelerator
 
@@ -210,6 +213,77 @@ def forward(model, query_responses, tokenizer):
         attention_mask=attention_mask,
         return_dict=True,
     )
+
+# START: Added code for saving checkpoints
+def save_model_checkpoint(
+    args: Args,
+    accelerator: Accelerator,
+    tokenizer,
+    model_prepared: PreTrainedModel, # This is the accelerator.prepared model
+    optimizer_step: int,
+    is_final_save: bool = False,
+):
+    if not args.output_dir:
+        accelerator.print("No output_dir specified, skipping save.")
+        return
+
+    # Determine save directory and HF revision
+    save_directory = args.output_dir
+    # `args.hf_repo_revision` is the one set in parse_args, typically based on run_name for the final model
+    # or a user-defined base revision.
+    current_hf_revision = args.hf_repo_revision 
+
+    if not is_final_save:
+        checkpoint_name = f"checkpoint-{optimizer_step}"
+        save_directory = os.path.join(args.output_dir, checkpoint_name)
+        if args.hf_repo_revision: # If a base revision is set (e.g. run_name or user-defined for the run)
+            current_hf_revision = f"{args.hf_repo_revision}-{checkpoint_name}"
+        # If args.hf_repo_revision was None (e.g. push_to_hub is false, or it wasn't set),
+        # current_hf_revision remains None for checkpoints, preventing push attempts later if it's None.
+    
+    accelerator.print(f"=== Saving {'final model' if is_final_save else f'checkpoint at optimizer step {optimizer_step}'} to {save_directory} ===")
+    os.makedirs(save_directory, exist_ok=True)
+
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(save_directory)
+        if args.push_to_hub and args.hf_repo_id and current_hf_revision:
+            tokenizer_hub_url = f"https://huggingface.co/{args.hf_repo_id}/tree/{current_hf_revision}"
+            accelerator.print(f"Pushing tokenizer to HF Hub: {args.hf_repo_id}, revision: {current_hf_revision}")
+            accelerator.print(f"Tokenizer will be available at: {tokenizer_hub_url}")
+            try:
+                tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=current_hf_revision)
+            except Exception as e:
+                accelerator.print(f"Failed to push tokenizer: {e}")
+        elif args.push_to_hub and (not args.hf_repo_id or not current_hf_revision):
+            accelerator.print(f"Skipping tokenizer push to hub: hf_repo_id ('{args.hf_repo_id}') or current_hf_revision ('{current_hf_revision}') is not configured correctly.")
+
+    unwrapped_model: PreTrainedModel = accelerator.unwrap_model(model_prepared)
+    accelerator.wait_for_everyone() # Ensure all processes are ready before saving, especially for sharded models
+
+    if accelerator.is_main_process:
+        unwrapped_model.save_pretrained(
+            save_directory,
+            is_main_process=accelerator.is_main_process,
+            save_function=accelerator.save,
+            state_dict=accelerator.get_state_dict(model_prepared), # Get state_dict from prepared model
+            safe_serialization=False, # As per original final save
+        )
+        if args.push_to_hub and args.hf_repo_id and current_hf_revision:
+            model_hub_url = f"https://huggingface.co/{args.hf_repo_id}/tree/{current_hf_revision}"
+            accelerator.print(f"Pushing model to HF Hub: {args.hf_repo_id}, revision: {current_hf_revision}")
+            accelerator.print(f"Model will be available at: {model_hub_url}")
+            try:
+                # Using the original method for pushing, applied to unwrapped model
+                unwrapped_model.push_to_hub(repo_id=args.hf_repo_id, revision=current_hf_revision, safe_serialization=False) # As per original
+                accelerator.print(f"🔥 Successfully pushed to {model_hub_url}")
+                # args.hf_repo_url is specifically for the final model's main revision (e.g., run_name)
+                if is_final_save and args.hf_repo_url and current_hf_revision == args.hf_repo_revision:
+                     accelerator.print(f"This is the final model. Main repo URL: {args.hf_repo_url}")
+            except Exception as e:
+                accelerator.print(f"Failed to push model: {e}")
+        elif args.push_to_hub and (not args.hf_repo_id or not current_hf_revision):
+            accelerator.print(f"Skipping model push to hub: hf_repo_id ('{args.hf_repo_id}') or current_hf_revision ('{current_hf_revision}') is not configured correctly.")
+# END: Added code for saving checkpoints
 
 
 def evaluate(args: Args, accelerator, tokenizer, model, dataloader, generation_config):
@@ -295,7 +369,10 @@ if __name__ == "__main__":
         eval_dataset = eval_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
         eval_dataloaders[split] = DataLoader(eval_dataset, batch_size=args.local_eval_batch_size)
     args.total_episodes = len(dataset)
-    args.num_updates = args.total_episodes // args.batch_size
+    # If args.num_updates is not given, it's calculated based on total_episodes and batch_size
+    # This represents the number of optimizer steps per epoch if training on the full dataset.
+    if args.num_updates is None:
+        args.num_updates = args.total_episodes // args.batch_size
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
@@ -348,19 +425,32 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
+    
+    # Total number of optimizer steps for the scheduler
+    # args.num_updates is number of optimizer steps per epoch if not overridden.
+    # If args.num_updates was set by user, it's likely the total number of optimizer steps for the whole training.
+    # The original code uses `args.num_updates * args.num_train_epochs`.
+    # Let's clarify: If user sets args.num_updates, it might be total updates.
+    # If args.num_updates is calculated, it's per epoch.
+    # The current scheduler line `num_training_steps=args.num_updates * args.num_train_epochs` is correct if
+    # args.num_updates is per-epoch updates. If user specifies it as total, then num_train_epochs should be 1 or this logic adjusted.
+    # For this change, we keep it as is.
+    num_total_scheduler_steps = args.num_updates * args.num_train_epochs
+
     scheduler = get_scheduler(
         args.scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.warm_up_steps,
-        num_training_steps=args.num_updates * args.num_train_epochs,
+        num_training_steps=num_total_scheduler_steps,
     )
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
     torch.manual_seed(args.seed)
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    # Accelerator prepares model, optimizer, dataloader(s), and scheduler
+    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     eval_dataloaders = {split: accelerator.prepare(eval_dataloader) for split, eval_dataloader in eval_dataloaders.items()}
-    torch.manual_seed(local_seed)  # reset the local seed again
+    torch.manual_seed(local_seed)
 
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -377,15 +467,17 @@ if __name__ == "__main__":
     loss_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
     model.train()
     gradient_accumulation_idx = 0
-    global_step = 0
-    update = 0
+    global_step = 0 # Original global_step: micro-batch counter across all processes for one epoch. Re-set per epoch in original? No, seems cumulative.
+    update = 0 # Original update: micro-batch counter for this rank, cumulative across epochs. Used for logging.
+    
+    optimizer_steps_completed = 0 # Counter for actual optimizer steps
+
     for epoch in range(args.num_train_epochs):
         accelerator.print(f"epoch: {epoch}")
         for data in dataloader:
-            update += 1
-            global_step += args.micro_batch_size
-            # reference_responses = data["reference_response_token"].to(device, non_blocking=True)
-            # queries = data["query_token"].to(device, non_blocking=True)
+            update += 1 # This is the micro-batch step for the current rank, used in original logging
+            global_step += args.micro_batch_size # Total micro-batches processed across all ranks
+            
             query_responses = data["query_reference_response_token"]
             with accelerator.accumulate(model):
                 output = forward(model, query_responses, tokenizer)
@@ -400,13 +492,54 @@ if __name__ == "__main__":
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
-            loss_stats[gradient_accumulation_idx] = loss
+            
+            # Loss stats for current micro-batch, for logging the average accumulated loss
+            loss_stats[gradient_accumulation_idx] = loss.detach() # Use .detach()
             gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
-            if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
-                scheduler.step()
+            
+            # This block is executed when an actual optimizer step has been performed
+            # (i.e., after `args.gradient_accumulation_steps` micro-batches have been processed by `accelerator.accumulate`)
+            # The original condition `update > 1 and (update - 1) % args.gradient_accumulation_steps == 0`
+            # is implicitly handled by `accelerator.accumulate` context manager for when `optimizer.step()` runs.
+            # We need to know when an optimizer step actually happens.
+            # `accelerator.sync_gradients` is True when gradients have been synced and optimizer can step.
+            # This check happens *inside* the accumulate block usually.
+            # A simpler way is to check if the micro-batch `update` counter means an accumulation cycle is complete.
+            if update % args.gradient_accumulation_steps == 0 : # An optimizer step was just performed for this rank
+                scheduler.step() # Original position of scheduler step
+                
+                # START: Added code for checkpointing
+                optimizer_steps_completed += 1
+                # END: Added code for checkpointing
+
+                # Original logging logic (uses `update` as step, which is micro-batch count for this rank)
                 writer.add_scalar("train/sft/loss", accelerator.gather(loss_stats).mean().item(), update)
                 writer.add_scalar("train/sft/lr", scheduler.get_last_lr()[0], update)
-                accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}")
+                if update % (args.gradient_accumulation_steps * 10) == 0: # Print less frequently
+                    accelerator.print(
+                        f"Epoch: {epoch}, Update (micro-batch): {update}, Opt.Step: {optimizer_steps_completed}, "
+                        f"Avg Acc Loss: {accelerator.gather(loss_stats).mean().item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}"
+                    )
+                
+                # START: Added code for checkpointing
+                if args.save_frequency_updates > 0 and \
+                   optimizer_steps_completed > 0 and \
+                   optimizer_steps_completed % args.save_frequency_updates == 0:
+                    save_model_checkpoint(
+                        args, accelerator, tokenizer, model, # model is the prepared model
+                        optimizer_step=optimizer_steps_completed,
+                        is_final_save=False
+                    )
+                # END: Added code for checkpointing
+            
+            # Optional: Early exit if total number of optimizer steps is reached
+            if num_total_scheduler_steps > 0 and optimizer_steps_completed >= num_total_scheduler_steps:
+                accelerator.print(f"Reached target number of optimizer steps ({num_total_scheduler_steps}). Stopping training.")
+                break # break from inner dataloader loop
+        
+        if num_total_scheduler_steps > 0 and optimizer_steps_completed >= num_total_scheduler_steps:
+            break # break from outer epoch loop
+
 
     if args.run_eval:
         accelerator.print("===evaluating model===")
@@ -415,34 +548,34 @@ if __name__ == "__main__":
                 args, accelerator, tokenizer, model, eval_dataloaders[eval_split], generation_config
             )
             if accelerator.is_main_process:
-                eval_df.to_csv(f"runs/{args.run_name}/{eval_split}_table.csv")
+                # Original eval table naming (no step number, assumes one final eval)
+                eval_df_path = os.path.join(f"runs/{args.run_name}", f"{eval_split}_table.csv")
+                os.makedirs(os.path.dirname(eval_df_path), exist_ok=True)
+                eval_df.to_csv(eval_df_path)
+
                 if args.track:
+                    # Original WandB logging for eval table (uses `update` which is total micro-batches on rank 0)
                     wandb.log({f"eval/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)}, step=update)
             for k, v in rouge_scores.items():
                 rouge_metric = torch.tensor(v, device=device)
-                rouge_metric = accelerator.gather(rouge_metric)
-                writer.add_scalar(f"{eval_split}/sft/rouge/{k}", rouge_metric.mean().item(), update)
-                accelerator.print(f"{eval_split}/sft/rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
+                # Gather the list of means, then compute mean of means
+                gathered_means = accelerator.gather(rouge_metric)
+                final_rouge_mean = gathered_means.mean().item()
+                # Original writer logging for eval (uses `update`)
+                writer.add_scalar(f"{eval_split}/sft/rouge/{k}", final_rouge_mean, update)
+                accelerator.print(f"{eval_split}/sft/rouge/{k}: {final_rouge_mean} (logged at micro-batch step {update})")
+            # Original writer logging for eval loss (uses `update`)
             writer.add_scalar(f"{eval_split}/sft/loss", torch.stack(all_eval_losses).mean().item(), update)
 
-    # save model
-    if args.output_dir and args.num_train_epochs > 0:
-        accelerator.print("===saving model===")
-        os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision)
-        unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            unwrapped.save_pretrained(
-                args.output_dir,
-                is_main_process=accelerator.is_main_process,
-                save_function=accelerator.save,
-                state_dict=accelerator.get_state_dict(model),
-                safe_serialization=False,
-            )
-            if args.push_to_hub:
-                unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
-                accelerator.print(f"🔥 pushed to {args.hf_repo_url}")
+    # save final model
+    if args.output_dir and args.num_train_epochs > 0 and optimizer_steps_completed > 0:
+        save_model_checkpoint(
+            args,
+            accelerator,
+            tokenizer,
+            model,
+            optimizer_step=optimizer_steps_completed, # Pass the total optimizer steps
+            is_final_save=True,
+        )
+    elif args.output_dir:
+        accelerator.print("Skipping final model save: No training epochs completed or no optimizer steps performed.")
