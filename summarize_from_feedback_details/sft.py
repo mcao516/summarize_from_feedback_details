@@ -214,7 +214,7 @@ def forward(model, query_responses, tokenizer):
         return_dict=True,
     )
 
-# START: Added code for saving checkpoints
+
 def save_model_checkpoint(
     args: Args,
     accelerator: Accelerator,
@@ -266,15 +266,14 @@ def save_model_checkpoint(
             is_main_process=accelerator.is_main_process,
             save_function=accelerator.save,
             state_dict=accelerator.get_state_dict(model_prepared), # Get state_dict from prepared model
-            safe_serialization=False, # As per original final save
+            safe_serialization=False,
         )
         if args.push_to_hub and args.hf_repo_id and current_hf_revision:
             model_hub_url = f"https://huggingface.co/{args.hf_repo_id}/tree/{current_hf_revision}"
             accelerator.print(f"Pushing model to HF Hub: {args.hf_repo_id}, revision: {current_hf_revision}")
             accelerator.print(f"Model will be available at: {model_hub_url}")
             try:
-                # Using the original method for pushing, applied to unwrapped model
-                unwrapped_model.push_to_hub(repo_id=args.hf_repo_id, revision=current_hf_revision, safe_serialization=False) # As per original
+                unwrapped_model.push_to_hub(repo_id=args.hf_repo_id, revision=current_hf_revision, safe_serialization=False)
                 accelerator.print(f"🔥 Successfully pushed to {model_hub_url}")
                 # args.hf_repo_url is specifically for the final model's main revision (e.g., run_name)
                 if is_final_save and args.hf_repo_url and current_hf_revision == args.hf_repo_revision:
@@ -283,7 +282,6 @@ def save_model_checkpoint(
                 accelerator.print(f"Failed to push model: {e}")
         elif args.push_to_hub and (not args.hf_repo_id or not current_hf_revision):
             accelerator.print(f"Skipping model push to hub: hf_repo_id ('{args.hf_repo_id}') or current_hf_revision ('{current_hf_revision}') is not configured correctly.")
-# END: Added code for saving checkpoints
 
 
 def evaluate(args: Args, accelerator, tokenizer, model, dataloader, generation_config):
@@ -540,6 +538,19 @@ if __name__ == "__main__":
         if num_total_scheduler_steps > 0 and optimizer_steps_completed >= num_total_scheduler_steps:
             break # break from outer epoch loop
 
+    # save final model
+    if args.output_dir and args.num_train_epochs > 0 and optimizer_steps_completed > 0:
+        accelerator.print("===saving final model===")
+        save_model_checkpoint(
+            args,
+            accelerator,
+            tokenizer,
+            model,
+            optimizer_step=optimizer_steps_completed, # Pass the total optimizer steps
+            is_final_save=True,
+        )
+    elif args.output_dir:
+        accelerator.print("Skipping final model save: No training epochs completed or no optimizer steps performed.")
 
     if args.run_eval:
         accelerator.print("===evaluating model===")
@@ -566,16 +577,3 @@ if __name__ == "__main__":
                 accelerator.print(f"{eval_split}/sft/rouge/{k}: {final_rouge_mean} (logged at micro-batch step {update})")
             # Original writer logging for eval loss (uses `update`)
             writer.add_scalar(f"{eval_split}/sft/loss", torch.stack(all_eval_losses).mean().item(), update)
-
-    # save final model
-    if args.output_dir and args.num_train_epochs > 0 and optimizer_steps_completed > 0:
-        save_model_checkpoint(
-            args,
-            accelerator,
-            tokenizer,
-            model,
-            optimizer_step=optimizer_steps_completed, # Pass the total optimizer steps
-            is_final_save=True,
-        )
-    elif args.output_dir:
-        accelerator.print("Skipping final model save: No training epochs completed or no optimizer steps performed.")
