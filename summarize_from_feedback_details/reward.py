@@ -109,6 +109,8 @@ class Args:
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
+    wandb_dir: Optional[str] = None
+    """The absolute path to the directory where experiment logs and metadata files are stored"""
     push_to_hub: bool = False
     """whether to upload the saved model to huggingface"""
     hf_entity: Optional[str] = None
@@ -340,6 +342,7 @@ if __name__ == "__main__":
                 config=asdict(args),
                 name=args.run_name,
                 save_code=True,
+                dir=args.wandb_dir,
             )
             file_extensions = [".toml", ".lock", ".py", ".sh", ".yaml"]
             wandb.run.log_code(".", include_fn=lambda path: any([path.endswith(ext) for ext in file_extensions]))
@@ -431,28 +434,6 @@ if __name__ == "__main__":
                     f"{train_accuracy=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}"
                 )
 
-    if args.run_eval:
-        for eval_split in eval_dataloaders:
-            evaluate_df = evaluate(args, accelerator, tokenizer, model, eval_dataloaders[eval_split])
-            for split, row in evaluate_df[["split", "accuracy"]].groupby(["split"]).mean().iterrows():
-                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/split/{split}", row["accuracy"], global_step)
-                accelerator.print(f"eval/rm/{eval_split}/accuracy/split/{split}: {row['accuracy']}")
-            for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
-                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/batch/{batch}", row["accuracy"], global_step)
-                accelerator.print(f"eval/rm/{eval_split}/accuracy/batch/{batch}: {row['accuracy']}")
-            for confi, row in evaluate_df[["confidence", "accuracy"]].groupby(["confidence"]).mean().iterrows():
-                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/confidence/{confi}", row["accuracy"], global_step)
-                accelerator.print(f"eval/rm/{eval_split}/accuracy/confidence/{confi}: {row['accuracy']}")
-            writer.add_scalar(f"eval/rm/{eval_split}/accuracy", evaluate_df["accuracy"].mean(), global_step)
-            accelerator.print(f"eval/rm/{eval_split}/accuracy: {evaluate_df['accuracy'].mean()}")
-            if accelerator.is_main_process:
-                os.makedirs(f"eval_tables/{args.run_name}", exist_ok=True)
-                evaluate_df.to_csv(f"eval_tables/{args.run_name}/eval_{eval_split}_{update}.csv")
-                if args.track:
-                    wandb.log({f"samples/{eval_split}/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
-            del evaluate_df
-            torch.cuda.empty_cache()
-
     norm_dataset = load_dataset(args.query_dataset, split="train")
     norm_dataset = norm_dataset.with_format("torch", columns=["query_token", "reference_response_token", "query_reference_response_token"])
     norm_dataset = norm_dataset.shuffle(seed=local_seed)
@@ -528,3 +509,25 @@ if __name__ == "__main__":
             if args.push_to_hub:
                 unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
                 accelerator.print(f"🔥 pushed to {args.hf_repo_url}")
+
+    if args.run_eval:
+        for eval_split in eval_dataloaders:
+            evaluate_df = evaluate(args, accelerator, tokenizer, model, eval_dataloaders[eval_split])
+            for split, row in evaluate_df[["split", "accuracy"]].groupby(["split"]).mean().iterrows():
+                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/split/{split}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/{eval_split}/accuracy/split/{split}: {row['accuracy']}")
+            for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
+                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/batch/{batch}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/{eval_split}/accuracy/batch/{batch}: {row['accuracy']}")
+            for confi, row in evaluate_df[["confidence", "accuracy"]].groupby(["confidence"]).mean().iterrows():
+                writer.add_scalar(f"eval/rm/{eval_split}/accuracy/confidence/{confi}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/{eval_split}/accuracy/confidence/{confi}: {row['accuracy']}")
+            writer.add_scalar(f"eval/rm/{eval_split}/accuracy", evaluate_df["accuracy"].mean(), global_step)
+            accelerator.print(f"eval/rm/{eval_split}/accuracy: {evaluate_df['accuracy'].mean()}")
+            if accelerator.is_main_process:
+                os.makedirs(f"eval_tables/{args.run_name}", exist_ok=True)
+                evaluate_df.to_csv(f"eval_tables/{args.run_name}/eval_{eval_split}_{update}.csv")
+                if args.track:
+                    wandb.log({f"samples/{eval_split}/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
+            del evaluate_df
+            torch.cuda.empty_cache()
