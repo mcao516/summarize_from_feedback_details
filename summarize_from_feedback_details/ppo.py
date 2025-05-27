@@ -147,7 +147,7 @@ class Args:
     # wandb and HF tracking configs
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "tldr_ensemble_1b"
+    wandb_project_name: str = "tldr_summarize"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -878,20 +878,19 @@ if __name__ == "__main__":
                 postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
                 # query_response: [local_rollout_forward_batch_size, max_query_len + response_len]
-                with torch.no_grad():
-                    full_value, _, _ = get_reward(
-                        accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
-                    )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                    # score: [local_rollout_forward_batch_size]
-                    # _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
-                    dense_score, score, _ = get_reward(
-                        reward_model,
-                        postprocessed_query_response,
-                        tokenizer,
-                        context_length,
-                        reward_type=args.reward_type,
-                    )
+                full_value, _, _ = get_reward(
+                    accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
+                )
+                value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                # score: [local_rollout_forward_batch_size]
+                # _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
+                dense_score, score, _ = get_reward(
+                    reward_model,
+                    postprocessed_query_response,
+                    tokenizer,
+                    context_length,
+                    reward_type=args.reward_type,
+                )
 
                 query_responses.append(query_response)
                 responses.append(response)
@@ -939,7 +938,6 @@ if __name__ == "__main__":
             # sequence_lengths_p1: index of the first padding token
             # sequence_lengths: index of the first EOS token
             actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
-            # rewards_ = rewards + dense_scores
             if args.use_dense_rewards:
                 rewards += dense_scores
             else:
