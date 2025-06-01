@@ -32,13 +32,6 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
-import shap
-from summarize_from_feedback_details.shap_reward import parse_sentence, get_shap_rewards
-from summarize_from_feedback_details.attr_reward import get_attr_rewards
-from abcrl.attention.redistribution import (
-    get_attention_distribution,
-    get_generator_attention_distribution,
-)
 
 torch.set_printoptions(precision=4, sci_mode=False)
 api = HfApi()
@@ -93,8 +86,6 @@ class Args:
     # various batch sizes
     world_size: Optional[int] = None
     """The number of processes (GPUs) to use"""
-    num_train_epochs: int = 1
-    """Number of epochs to train"""
     num_updates: Optional[int] = None
     """The number of updates to train"""
     gradient_accumulation_steps: int = 64
@@ -163,16 +154,8 @@ class Args:
     """the url of the saved model in the Hugging Face Hub (will be autoset)"""
     output_dir: str = "models/ppo_model"
     """Where to save the model"""
-
-    # mine
-    use_dense_rewards: bool = False
-    """whether to use dense rewards"""
-    reward_type: str = "sparse"
-    """Reward type"""
-    sparse_weight: float = 1.0
-    """Weight of sparse rewards"""
-    dense_weight: float = 1.0
-    """Weight of dense rewards"""
+    save_frequency: int = 0
+    """Save checkpoint every N updates (PPO epochs). 0 means only at the end. Recommended value: 50, 100, or 200"""
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
@@ -291,164 +274,29 @@ class ScalarModel(PreTrainedModel):
         )
 
     def forward(self, **kwargs):
-        return_lm_hidden_states = kwargs.pop("return_lm_hidden_states", False)
-
         output = self.lm_backbone(**kwargs)
         reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
-
-        if return_lm_hidden_states:
-            return reward, output
-        else:
-            return reward
+        return reward
 
 
-def get_reward(
-    model,
-    query_responses,
-    tokenizer,
-    context_length,
-    reward_type="sparse",
-):
-    """
-    Args:
-        query_responses: [curr_batch_size, query_responses_len]
-
-    Returns:
-        reward_logits: [curr_batch_size, query_responses_len, 1]
-        score: [curr_batch_size]
-        sequence_lengths: [curr_batch_size]
-    """
+def get_reward(model, query_responses, tokenizer, context_length):
     attention_mask = query_responses != tokenizer.pad_token_id
     # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    reward_logits, rm_hidden_states = model(
+    reward_logits = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         # position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
-        output_attentions=True,
-        return_lm_hidden_states=True,
     )
-    # reward_logits: [batch_size, query_responses_len, 1]
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    seq_rewards = reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1)
-    if reward_type == "sparse":
-        return (
-            reward_logits,
-            seq_rewards,
-            sequence_lengths,
-        )
-    elif reward_type == "dummy_dense":
-        batch_size = reward_logits.size(0)
-        response_max_length = query_responses.size(1) - context_length
-        dense_rewards = torch.zeros(batch_size, response_max_length).to(reward_logits)
-        return (
-            dense_rewards,
-            seq_rewards,
-            sequence_lengths,
-        )
-    elif reward_type == "abc":
-        batch_size = reward_logits.size(0)
-        response_max_length = query_responses.size(1) - context_length
-        dense_rewards = torch.zeros((batch_size, response_max_length)).to(reward_logits)
-
-        attentions = rm_hidden_states.attentions[-1].mean(1)
-        for i in range(batch_size):
-            attn_scores = get_attention_distribution(
-                query_responses[i, context_length:],  # response
-                query_responses[i, :context_length],  # query
-                attentions[i],
-            )
-            redist_reward = torch.tensor(attn_scores).to(reward_logits) * seq_rewards[i]
-            assert redist_reward.shape[0] == response_max_length
-            
-            dense_rewards[i, :] = redist_reward
-        return (
-            dense_rewards,
-            seq_rewards,
-            sequence_lengths,
-        )
-    elif reward_type == "token_shap":
-        batch_size = reward_logits.size(0)
-        response_max_length = query_responses.size(1) - context_length
-        dense_rewards = np.zeros((batch_size, response_max_length))
-        for i in range(batch_size):
-            try:
-                shap_values = get_shap_rewards(model, query_responses[i], tokenizer, context_length).values
-                m = shap_values.shape[1]  # Length of the current array
-                # assert response_lengths[i] + 1 == m, f"{response_lengths[i] + 1} : {m}"
-                # if m > response_max_length:
-                #     raise ValueError(f"Array at index {i} has length {m} greater than the target length {response_max_length}.")
-                dense_rewards[i, :m] = shap_values
-            except ValueError as v:
-                print("SHAP Value Error: ", v)
-            except Exception as e:
-                print("SHAP Exception: ", e)
-        dense_rewards = torch.tensor(dense_rewards).to(reward_logits)
-        return (
-            dense_rewards,
-            seq_rewards,
-            sequence_lengths,
-        )
-    elif reward_type == "span_shap":
-        batch_size = reward_logits.size(0)
-        response_max_length = query_responses.size(1) - context_length
-        dense_rewards = np.zeros((batch_size, response_max_length))
-        for i in range(batch_size):
-            try:
-                shap_outputs = get_shap_rewards(
-                    model,
-                    query_responses[i],
-                    tokenizer,
-                    context_length,
-                    masker=shap.maskers.Text(parse_sentence, mask_token=" ", collapse_mask_token=True)
-                )
-                shap_values, shap_data = shap_outputs.values, shap_outputs.data
-                shap_values = np.squeeze(shap_values)
-
-                for n in range(1, len(shap_values) + 1):
-                    sents = "".join(shap_data[0][:n])
-                    idx = len(tokenizer.encode(sents)) - 1
-
-                    if idx > len(dense_rewards[i]) - 1:
-                        print("idx: {}; dense_rewards: {}".format(idx, len(dense_rewards)))
-                        dense_rewards[i, -1] = shap_values[n-1]
-                    else:
-                        dense_rewards[i, idx] = shap_values[n-1]
-            except ValueError as ve:
-                print(ve)
-        dense_rewards = torch.tensor(dense_rewards).to(reward_logits)
-        return (
-            dense_rewards,
-            seq_rewards,
-            sequence_lengths,
-        )
-    elif reward_type == "attr_lig":
-        batch_size = reward_logits.size(0)
-        response_max_length = query_responses.size(1) - context_length
-        dense_rewards = torch.zeros((batch_size, response_max_length)).to(reward_logits)
-        for i in range(batch_size):
-            try:
-                attr_scores = get_attr_rewards(
-                    model,
-                    query_responses[i],
-                    tokenizer, context_length,
-                    n_steps=100,
-                    internal_batch_size=20,
-                )
-                assert attr_scores.shape[0] == response_max_length
-                dense_rewards[i, :] = attr_scores
-            except Exception as e:
-                print("Attr Exception: ", e)
-        return (
-            dense_rewards,
-            seq_rewards,
-            sequence_lengths,
-        )
-    else:
-        raise ValueError(f"Unknown reward type: {reward_type}")
+    return (
+        reward_logits,
+        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
+        sequence_lengths,
+    )
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -523,7 +371,7 @@ def forward(model, query_responses, tokenizer):
 def evaluate(reward_model, policy, tokenizer, dataloader, generation_config, sampling=True):
     eval_storage = defaultdict(list)
     with torch.no_grad():
-        for data in tqdm(dataloader, disable=sampling):
+        for data in tqdm(dataloader):
             queries = data["query_token"]
             reference_response_token = data["reference_response_token"]
             context_length = queries.shape[1]
@@ -568,6 +416,43 @@ def evaluate(reward_model, policy, tokenizer, dataloader, generation_config, sam
     return eval_storage, eval_df
 
 
+def save_checkpoint(
+    checkpoint_dir: str,
+    accelerator: Accelerator,
+    unwrapped_policy: PreTrainedModel,
+    tokenizer: AutoTokenizer,
+    args_for_hub_push: Args, # Pass the main Args object
+    is_final_save: bool = False,
+):
+    """Saves the model and tokenizer to the specified directory."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(checkpoint_dir)
+        if is_final_save and args_for_hub_push.push_to_hub:
+            tokenizer.push_to_hub(repo_id=args_for_hub_push.hf_repo_id, revision=args_for_hub_push.hf_repo_revision)
+            accelerator.print(f"Tokenizer pushed to hub: {args_for_hub_push.hf_repo_id}/{args_for_hub_push.hf_repo_revision}")
+
+    accelerator.wait_for_everyone() # Wait for all processes to reach this point
+
+    if accelerator.is_main_process:
+        unwrapped_policy.save_pretrained(
+            checkpoint_dir,
+            is_main_process=accelerator.is_main_process,
+            save_function=accelerator.save,
+            state_dict=accelerator.get_state_dict(unwrapped_policy),
+            safe_serialization=False, # Set to True if preferred and compatible
+        )
+        if is_final_save and args_for_hub_push.push_to_hub:
+            unwrapped_policy.push_to_hub(
+                repo_id=args_for_hub_push.hf_repo_id,
+                revision=args_for_hub_push.hf_repo_revision,
+                safe_serialization=False # Set to True if preferred
+            )
+            accelerator.print(f"Model pushed to hub: {args_for_hub_push.hf_repo_url}")
+
+    accelerator.wait_for_everyone() # Ensure saving is complete on main process before others continue
+
+
 if __name__ == "__main__":
     args, accelerator = parse_args()
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
@@ -575,7 +460,7 @@ if __name__ == "__main__":
     # load dataset
     dataset = load_dataset(args.query_dataset, split="train")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True, drop_last=True)
     eval_dataloaders = {}
     for split in ["validation", "test"]:
         eval_dataset = load_dataset(args.query_dataset, split=split)
@@ -606,7 +491,7 @@ if __name__ == "__main__":
                 sync_tensorboard=True,
                 config=asdict(args),
                 name=args.run_name,
-                save_code=True,
+                save_code=False,
             )
             file_extensions = [".toml", ".lock", ".py", ".sh", ".yaml"]
             wandb.run.log_code(".", include_fn=lambda path: any([path.endswith(ext) for ext in file_extensions]))
@@ -735,7 +620,6 @@ if __name__ == "__main__":
                 tokenizer,
                 eval_dataloaders[eval_split],
                 validation_generation_config,
-                sampling=True,
             )
             validation_score = eval_storage["score"][0]
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
@@ -756,12 +640,9 @@ if __name__ == "__main__":
             ref_logprobs = []
             values = []
             scores = []
-            dense_scores = []
             sequence_lengths = []
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
-                # query: [local_rollout_forward_batch_size, max_query_len]
-                # query_response: [local_rollout_forward_batch_size, max_query_len + response_len]
                 query_response, logits = generate(
                     accelerator.unwrap_model(model).policy,
                     query,
@@ -775,7 +656,7 @@ if __name__ == "__main__":
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                 del logits, all_logprob
                 torch.cuda.empty_cache()
-                # ref_logprob: [local_rollout_forward_batch_size, response_len]
+
                 ref_output = forward(ref_policy, query_response, tokenizer)
                 ref_logits = ref_output.logits[:, context_length - 1 : -1]
                 ref_logits /= args.temperature + 1e-7
@@ -790,20 +671,11 @@ if __name__ == "__main__":
                 # Response Processing 2. run reward model on the truncated responses
                 postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
-                # query_response: [local_rollout_forward_batch_size, max_query_len + response_len]
                 full_value, _, _ = get_reward(
                     accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
                 )
                 value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                # score: [local_rollout_forward_batch_size]
-                # _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
-                dense_score, score, _ = get_reward(
-                    reward_model,
-                    postprocessed_query_response,
-                    tokenizer,
-                    context_length,
-                    reward_type=args.reward_type,
-                )
+                _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
 
                 query_responses.append(query_response)
                 responses.append(response)
@@ -813,7 +685,6 @@ if __name__ == "__main__":
                 values.append(value)
                 sequence_lengths.append(sequence_length)
                 scores.append(score)
-                dense_scores.append(dense_score)
             query_responses = torch.cat(query_responses, 0)
             responses = torch.cat(responses, 0)
             postprocessed_responses = torch.cat(postprocessed_responses, 0)
@@ -821,8 +692,10 @@ if __name__ == "__main__":
             ref_logprobs = torch.cat(ref_logprobs, 0)
             values = torch.cat(values, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
-            scores = torch.cat(scores, 0)  # [batch_size]
-            dense_scores = torch.cat(dense_scores, 0)  # [batch_size, response_max_length]
+            scores = torch.cat(scores, 0)
+            # if accelerator.is_main_process:
+            #     console.print("query-sum", data["query_token"].sum().detach().cpu())
+            #     console.print("responses-sum", responses.sum().detach().cpu())
             del (logprob, ref_logprob, full_value, value, score)
             torch.cuda.empty_cache()
 
@@ -844,19 +717,12 @@ if __name__ == "__main__":
             values = torch.masked_fill(values, padding_mask_p1, 0)
 
             # 4. compute rewards
-            kl = logprobs - ref_logprobs  # [batch_size, response_length]
+            kl = logprobs - ref_logprobs
             non_score_reward = -args.ppo.kl_coef * kl
             rewards = non_score_reward.clone()
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
-            # sequence_lengths: index of the first <EOS> token
-            # sequence_lengths_p1: index of the first <PAD> token
             actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
-            if args.use_dense_rewards:
-                dense_scores = torch.masked_fill(dense_scores, padding_mask_p1, 0)
-                rewards[[actual_start, actual_end]] += args.sparse_weight * scores
-                rewards += args.dense_weight * dense_scores
-            else:
-                rewards[[actual_start, actual_end]] += scores
+            rewards[[actual_start, actual_end]] += scores
 
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
@@ -931,6 +797,8 @@ if __name__ == "__main__":
                         accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
+                        # if accelerator.is_main_process:
+                        #     console.print("loss", loss.detach().cpu())
                         with torch.no_grad():
                             pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
                             prob_dist = torch.nn.functional.softmax(logits, dim=-1)
@@ -965,9 +833,28 @@ if __name__ == "__main__":
                     pg_loss_stats[: ppo_epoch_idx + 1].mean().item(),
                     "pg_clipfrac",
                     pg_clipfrac_stats[: ppo_epoch_idx + 1].mean().item(),
+                    "vf_loss",
+                    vf_loss_stats[: ppo_epoch_idx + 1].mean().item(),
                     "ratio",
                     ratio_stats[: ppo_epoch_idx + 1].mean().item(),
                 )
+
+        # Save checkpoint during training
+        if args.output_dir and args.save_frequency > 0 and update % args.save_frequency == 0:
+            checkpoint_save_dir = f"{args.output_dir}/checkpoint_{update}"
+            accelerator.print(f"Saving intermediate checkpoint to {checkpoint_save_dir} at update {update}")
+            policy_to_save = accelerator.unwrap_model(model).policy
+            save_checkpoint(
+                checkpoint_dir=checkpoint_save_dir,
+                accelerator=accelerator,
+                unwrapped_policy=policy_to_save,
+                tokenizer=tokenizer,
+                args_for_hub_push=args, # Pass the main args
+                is_final_save=False, # This is an intermediate save
+            )
+            accelerator.print(f"Intermediate checkpoint saved to {checkpoint_save_dir}")
+
+
         with torch.no_grad():
             mean_kl = kl.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean()
@@ -1011,25 +898,20 @@ if __name__ == "__main__":
                 eval_ds = Dataset.from_pandas(eval_df)
                 eval_ds.save_to_disk(f"runs/{args.run_name}/{eval_split}_dataset")
                 if args.track:
-                    wandb.log({f"eval/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)}, step=update)
+                    wandb.log({f"eval/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)})
 
-    # save model
-    if args.output_dir and args.num_train_epochs > 0:
-        os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision)
-        unwrapped: PreTrainedModel = accelerator.unwrap_model(model).policy
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            unwrapped.save_pretrained(
-                args.output_dir,
-                is_main_process=accelerator.is_main_process,
-                save_function=accelerator.save,
-                state_dict=accelerator.get_state_dict(unwrapped),
-                safe_serialization=False,
-            )
-            if args.push_to_hub:
-                unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
-                accelerator.print(f"🔥 pushed to https://huggingface.co/{args.hf_repo_id}/tree/{args.hf_repo_revision}")
+    # save final model
+    if args.output_dir:
+        accelerator.print(f"Saving final model to {args.output_dir}")
+        policy_to_save = accelerator.unwrap_model(model).policy
+        save_checkpoint(
+            checkpoint_dir=args.output_dir, # Final save goes to the main output_dir
+            accelerator=accelerator,
+            unwrapped_policy=policy_to_save,
+            tokenizer=tokenizer,
+            args_for_hub_push=args, # Pass the main args
+            is_final_save=True,
+        )
+        accelerator.print(f"Final model saved to {args.output_dir}")
+        if args.push_to_hub and accelerator.is_main_process: # Message already printed in save_checkpoint
+             accelerator.print(f"🚀 Final model and tokenizer (if configured) have been pushed to the Hugging Face Hub.")
