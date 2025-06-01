@@ -165,14 +165,14 @@ class Args:
     """Where to save the model"""
 
     # mine
-    use_dense_rewards: bool = False
-    """whether to use dense rewards"""
     reward_type: str = "sparse"
     """Reward type"""
     sparse_weight: float = 1.0
     """Weight of sparse rewards"""
     dense_weight: float = 1.0
     """Weight of dense rewards"""
+    save_frequency: int = 0
+    """Save checkpoint every N updates (PPO epochs). 0 means only at the end. Recommended value: 50, 100, or 200"""
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
@@ -327,7 +327,7 @@ def get_reward(
         # position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
-        output_attentions=True,
+        output_attentions=False,
         return_lm_hidden_states=True,
     )
     # reward_logits: [batch_size, query_responses_len, 1]
@@ -568,6 +568,43 @@ def evaluate(reward_model, policy, tokenizer, dataloader, generation_config, sam
     return eval_storage, eval_df
 
 
+def save_checkpoint(
+    checkpoint_dir: str,
+    accelerator: Accelerator,
+    unwrapped_policy: PreTrainedModel,
+    tokenizer: AutoTokenizer,
+    args_for_hub_push: Args, # Pass the main Args object
+    is_final_save: bool = False,
+):
+    """Saves the model and tokenizer to the specified directory."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(checkpoint_dir)
+        if is_final_save and args_for_hub_push.push_to_hub:
+            tokenizer.push_to_hub(repo_id=args_for_hub_push.hf_repo_id, revision=args_for_hub_push.hf_repo_revision)
+            accelerator.print(f"Tokenizer pushed to hub: {args_for_hub_push.hf_repo_id}/{args_for_hub_push.hf_repo_revision}")
+
+    accelerator.wait_for_everyone() # Wait for all processes to reach this point
+
+    if accelerator.is_main_process:
+        unwrapped_policy.save_pretrained(
+            checkpoint_dir,
+            is_main_process=accelerator.is_main_process,
+            save_function=accelerator.save,
+            state_dict=accelerator.get_state_dict(unwrapped_policy),
+            safe_serialization=False, # Set to True if preferred and compatible
+        )
+        if is_final_save and args_for_hub_push.push_to_hub:
+            unwrapped_policy.push_to_hub(
+                repo_id=args_for_hub_push.hf_repo_id,
+                revision=args_for_hub_push.hf_repo_revision,
+                safe_serialization=False # Set to True if preferred
+            )
+            accelerator.print(f"Model pushed to hub: {args_for_hub_push.hf_repo_url}")
+
+    accelerator.wait_for_everyone() # Ensure saving is complete on main process before others continue
+
+
 if __name__ == "__main__":
     args, accelerator = parse_args()
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
@@ -575,7 +612,7 @@ if __name__ == "__main__":
     # load dataset
     dataset = load_dataset(args.query_dataset, split="train")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True, drop_last=True)
     eval_dataloaders = {}
     for split in ["validation", "test"]:
         eval_dataset = load_dataset(args.query_dataset, split=split)
@@ -606,7 +643,7 @@ if __name__ == "__main__":
                 sync_tensorboard=True,
                 config=asdict(args),
                 name=args.run_name,
-                save_code=True,
+                save_code=False,
             )
             file_extensions = [".toml", ".lock", ".py", ".sh", ".yaml"]
             wandb.run.log_code(".", include_fn=lambda path: any([path.endswith(ext) for ext in file_extensions]))
@@ -851,7 +888,7 @@ if __name__ == "__main__":
             # sequence_lengths: index of the first <EOS> token
             # sequence_lengths_p1: index of the first <PAD> token
             actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
-            if args.use_dense_rewards:
+            if args.reward_type != "sparse":
                 dense_scores = torch.masked_fill(dense_scores, padding_mask_p1, 0)
                 rewards[[actual_start, actual_end]] += args.sparse_weight * scores
                 rewards += args.dense_weight * dense_scores
@@ -968,6 +1005,22 @@ if __name__ == "__main__":
                     "ratio",
                     ratio_stats[: ppo_epoch_idx + 1].mean().item(),
                 )
+
+        # Save checkpoint during training
+        if args.output_dir and args.save_frequency > 0 and update % args.save_frequency == 0:
+            checkpoint_save_dir = f"{args.output_dir}/checkpoint_{update}"
+            accelerator.print(f"Saving intermediate checkpoint to {checkpoint_save_dir} at update {update}")
+            policy_to_save = accelerator.unwrap_model(model).policy
+            save_checkpoint(
+                checkpoint_dir=checkpoint_save_dir,
+                accelerator=accelerator,
+                unwrapped_policy=policy_to_save,
+                tokenizer=tokenizer,
+                args_for_hub_push=args, # Pass the main args
+                is_final_save=False, # This is an intermediate save
+            )
+            accelerator.print(f"Intermediate checkpoint saved to {checkpoint_save_dir}")
+
         with torch.no_grad():
             mean_kl = kl.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean()
@@ -1011,25 +1064,20 @@ if __name__ == "__main__":
                 eval_ds = Dataset.from_pandas(eval_df)
                 eval_ds.save_to_disk(f"runs/{args.run_name}/{eval_split}_dataset")
                 if args.track:
-                    wandb.log({f"eval/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)}, step=update)
+                    wandb.log({f"eval/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)})
 
-    # save model
-    if args.output_dir and args.num_train_epochs > 0:
-        os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                tokenizer.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision)
-        unwrapped: PreTrainedModel = accelerator.unwrap_model(model).policy
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            unwrapped.save_pretrained(
-                args.output_dir,
-                is_main_process=accelerator.is_main_process,
-                save_function=accelerator.save,
-                state_dict=accelerator.get_state_dict(unwrapped),
-                safe_serialization=False,
-            )
-            if args.push_to_hub:
-                unwrapped.push_to_hub(repo_id=args.hf_repo_id, revision=args.hf_repo_revision, safe_serialization=False)
-                accelerator.print(f"🔥 pushed to https://huggingface.co/{args.hf_repo_id}/tree/{args.hf_repo_revision}")
+    # save final model
+    if args.output_dir:
+        accelerator.print(f"Saving final model to {args.output_dir}")
+        policy_to_save = accelerator.unwrap_model(model).policy
+        save_checkpoint(
+            checkpoint_dir=args.output_dir, # Final save goes to the main output_dir
+            accelerator=accelerator,
+            unwrapped_policy=policy_to_save,
+            tokenizer=tokenizer,
+            args_for_hub_push=args, # Pass the main args
+            is_final_save=True,
+        )
+        accelerator.print(f"Final model saved to {args.output_dir}")
+        if args.push_to_hub and accelerator.is_main_process: # Message already printed in save_checkpoint
+             accelerator.print(f"🚀 Final model and tokenizer (if configured) have been pushed to the Hugging Face Hub.")
