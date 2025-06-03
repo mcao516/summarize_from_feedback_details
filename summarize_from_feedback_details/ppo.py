@@ -32,13 +32,9 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
-import shap
-from summarize_from_feedback_details.shap_reward import parse_sentence, get_shap_rewards
-from summarize_from_feedback_details.attr_reward import get_attr_rewards
-from abcrl.attention.redistribution import (
-    get_attention_distribution,
-    get_generator_attention_distribution,
-)
+
+from summarize_from_feedback_details.shap_reward import get_shap_rewards
+
 
 torch.set_printoptions(precision=4, sci_mode=False)
 api = HfApi()
@@ -350,103 +346,37 @@ def get_reward(
             sequence_lengths,
         )
     elif reward_type == "abc":
-        batch_size = reward_logits.size(0)
-        response_max_length = query_responses.size(1) - context_length
-        dense_rewards = torch.zeros((batch_size, response_max_length)).to(reward_logits)
-
-        attentions = rm_hidden_states.attentions[-1].mean(1)
-        for i in range(batch_size):
-            attn_scores = get_attention_distribution(
-                query_responses[i, context_length:],  # response
-                query_responses[i, :context_length],  # query
-                attentions[i],
-            )
-            redist_reward = torch.tensor(attn_scores).to(reward_logits) * seq_rewards[i]
-            assert redist_reward.shape[0] == response_max_length
-            
-            dense_rewards[i, :] = redist_reward
-        return (
-            dense_rewards,
-            seq_rewards,
-            sequence_lengths,
-        )
-    elif reward_type == "token_shap":
+        raise NotImplementedError
+    elif reward_type == "shap_token":
         batch_size = reward_logits.size(0)
         response_max_length = query_responses.size(1) - context_length
         dense_rewards = np.zeros((batch_size, response_max_length))
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
         for i in range(batch_size):
-            try:
-                shap_values = get_shap_rewards(model, query_responses[i], tokenizer, context_length).values
-                m = shap_values.shape[1]  # Length of the current array
-                # assert response_lengths[i] + 1 == m, f"{response_lengths[i] + 1} : {m}"
-                # if m > response_max_length:
-                #     raise ValueError(f"Array at index {i} has length {m} greater than the target length {response_max_length}.")
-                dense_rewards[i, :m] = shap_values
-            except ValueError as v:
-                print("SHAP Value Error: ", v)
-            except Exception as e:
-                print("SHAP Exception: ", e)
+            if contain_eos_token[i]:
+                try:
+                    query_str = tokenizer.decode(query_responses[i][:context_length], skip_special_tokens=True)
+                    response_str = tokenizer.decode(query_responses[i][context_length:], skip_special_tokens=True)
+                    shap_outputs = get_shap_rewards(model, query_str, response_str, tokenizer)
+                    m = shap_outputs.values.shape[1]
+                    response_length = sequence_lengths[i] - context_length
+                    if m != response_length:
+                        raise ValueError(f"SHAP values [{i}] has length {m} greater than the response length {response_length}.")
+                    dense_rewards[i, :m] = shap_outputs.values
+                except Exception as e:
+                    print("SHAP Exception: ", e)
+            else:
+                print(f"Sample [{i}] has no <eos> token. Skip SHAP calculation.")
         dense_rewards = torch.tensor(dense_rewards).to(reward_logits)
         return (
             dense_rewards,
             seq_rewards,
             sequence_lengths,
         )
-    elif reward_type == "span_shap":
-        batch_size = reward_logits.size(0)
-        response_max_length = query_responses.size(1) - context_length
-        dense_rewards = np.zeros((batch_size, response_max_length))
-        for i in range(batch_size):
-            try:
-                shap_outputs = get_shap_rewards(
-                    model,
-                    query_responses[i],
-                    tokenizer,
-                    context_length,
-                    masker=shap.maskers.Text(parse_sentence, mask_token=" ", collapse_mask_token=True)
-                )
-                shap_values, shap_data = shap_outputs.values, shap_outputs.data
-                shap_values = np.squeeze(shap_values)
-
-                for n in range(1, len(shap_values) + 1):
-                    sents = "".join(shap_data[0][:n])
-                    idx = len(tokenizer.encode(sents)) - 1
-
-                    if idx > len(dense_rewards[i]) - 1:
-                        print("idx: {}; dense_rewards: {}".format(idx, len(dense_rewards)))
-                        dense_rewards[i, -1] = shap_values[n-1]
-                    else:
-                        dense_rewards[i, idx] = shap_values[n-1]
-            except ValueError as ve:
-                print(ve)
-        dense_rewards = torch.tensor(dense_rewards).to(reward_logits)
-        return (
-            dense_rewards,
-            seq_rewards,
-            sequence_lengths,
-        )
+    elif reward_type == "shap_span":
+        raise NotImplementedError
     elif reward_type == "attr_lig":
-        batch_size = reward_logits.size(0)
-        response_max_length = query_responses.size(1) - context_length
-        dense_rewards = torch.zeros((batch_size, response_max_length)).to(reward_logits)
-        for i in range(batch_size):
-            try:
-                attr_scores = get_attr_rewards(
-                    model,
-                    query_responses[i],
-                    tokenizer, context_length,
-                    n_steps=100,
-                    internal_batch_size=20,
-                )
-                assert attr_scores.shape[0] == response_max_length
-                dense_rewards[i, :] = attr_scores
-            except Exception as e:
-                print("Attr Exception: ", e)
-        return (
-            dense_rewards,
-            seq_rewards,
-            sequence_lengths,
-        )
+        raise NotImplementedError
     else:
         raise ValueError(f"Unknown reward type: {reward_type}")
 
