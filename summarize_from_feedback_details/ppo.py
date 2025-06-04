@@ -33,8 +33,9 @@ from transformers import (
     PreTrainedModel,
 )
 
+import shap
 from summarize_from_feedback_details.shap_reward import get_shap_rewards
-
+from summarize_from_feedback_details.shap_utils import parse_sentence
 
 torch.set_printoptions(precision=4, sci_mode=False)
 api = HfApi()
@@ -374,7 +375,47 @@ def get_reward(
             sequence_lengths,
         )
     elif reward_type == "shap_span":
-        raise NotImplementedError
+        batch_size = reward_logits.size(0)
+        response_max_length = query_responses.size(1) - context_length
+        dense_rewards = np.zeros((batch_size, response_max_length))
+        contain_eos_token = torch.any(query_responses[:, context_length:] == tokenizer.eos_token_id, dim=-1)
+        for i in range(batch_size):
+            if contain_eos_token[i]:
+                try:
+                    query_str = tokenizer.decode(query_responses[i][:context_length], skip_special_tokens=True)
+                    response_str = tokenizer.decode(query_responses[i][context_length:], skip_special_tokens=True)
+                    if len(parse_sentence(response_str)['input_ids']) == 1:
+                        print(f"Sample [{i}] cannot be parsed. Skip SHAP calculation.")
+                        continue
+                    
+                    shap_outputs = get_shap_rewards(
+                        model,
+                        query_str,
+                        response_str,
+                        tokenizer,
+                        masker=shap.maskers.Text(parse_sentence, mask_token=" ", collapse_mask_token=True)
+                    )
+                    shap_values, shap_data = np.squeeze(shap_outputs.values), shap_outputs.data
+                    assert "".join(shap_data[0]) == response_str, f"{''.join(shap_data[0])} \n {response_str}"
+                    for n in range(1, len(shap_values) + 1):
+                        sents = "".join(shap_data[0][:n])
+                        idx = len(tokenizer.encode(sents)) - 1
+        
+                        if idx > len(dense_rewards[i]) - 1:
+                            print("idx: {}; response length: {}".format(idx, len(dense_rewards)))
+                            dense_rewards[i, -1] = shap_values[n-1]
+                        else:
+                            dense_rewards[i, idx] = shap_values[n-1]
+                except Exception as e:
+                    print("SHAP Exception: ", e)
+            else:
+                print(f"Sample [{i}] has no <eos> token. Skip SHAP calculation.")
+        dense_rewards = torch.tensor(dense_rewards).to(reward_logits)
+        return (
+            dense_rewards,
+            seq_rewards,
+            sequence_lengths,
+        )
     elif reward_type == "attr_lig":
         raise NotImplementedError
     else:
@@ -823,7 +864,7 @@ if __name__ == "__main__":
                 rewards[[actual_start, actual_end]] += args.sparse_weight * scores
                 rewards += args.dense_weight * dense_scores
             else:
-                rewards[[actual_start, actual_end]] += scores
+                rewards[[actual_start, actual_end]] += args.sparse_weight * scores
 
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
