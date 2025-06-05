@@ -167,6 +167,7 @@ def _process_item_task(item_index, item_m1, item_m2, prompt_template,
 
     llm_response = None
     if args_config.evaluator_model_type == "GEMINI":
+        evaluator_specific_model_name = args_config.gemini_model_name
         llm_response = call_gemini_api(
             current_prompt,
             gemini_client_instance,
@@ -177,6 +178,7 @@ def _process_item_task(item_index, item_m1, item_m2, prompt_template,
             args_config.api_max_output_tokens
         )
     elif args_config.evaluator_model_type == "OPENAI":
+        evaluator_specific_model_name = args_config.openai_model_name
         llm_response = call_openai_api(
             current_prompt,
             openai_client_instance,
@@ -200,6 +202,7 @@ def _process_item_task(item_index, item_m1, item_m2, prompt_template,
         "summary_B_text": assigned_summary_b_text,
         "summary_B_origin": summary_b_origin_model,
         "llm_evaluator": args_config.evaluator_model_type,
+        "llm_evaluator_model": evaluator_specific_model_name,
         "llm_response_raw": llm_response,
         "decision_extracted": None,
         "winner": None
