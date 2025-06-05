@@ -1,3 +1,8 @@
+# mine
+analysis/outputs
+analysis/eval_outputs
+analysis/old_outputs
+
 dataset_visuals
 old
 .DS_Store
