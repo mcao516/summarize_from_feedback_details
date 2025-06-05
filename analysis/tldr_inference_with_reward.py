@@ -285,7 +285,7 @@ if __name__ == "__main__":
     eval_dataset = load_dataset(args.query_dataset, split=args.dataset_split)
     if "query_token" not in eval_dataset.column_names:
         raise ValueError(f"'query_token' column not found in dataset. Available columns: {eval_dataset.column_names}")
-    eval_dataset = eval_dataset.with_format("torch", columns=["query_token"])
+    eval_dataset = eval_dataset.with_format("torch", columns=["query_token"], output_all_columns=True)
     
     eval_dataloader = DataLoader(
         eval_dataset,
@@ -329,13 +329,14 @@ if __name__ == "__main__":
         # Decode for JSON output
         decoded_queries = tokenizer.batch_decode(queries.cpu(), skip_special_tokens=True)
         decoded_summaries = tokenizer.batch_decode(postprocessed_responses.cpu(), skip_special_tokens=True)
-        
+
         batch_results = []
         for i in range(len(decoded_queries)):
-            doc = decoded_queries[i]
+            doc = batch["query"][i]
+            decoded_doc = decoded_queries[i]
             summ = decoded_summaries[i]
             score_val = batch_scores_list[i] if batch_scores_list is not None else None
-            batch_results.append({"document": doc, "summary": summ, "score": score_val})
+            batch_results.append({"document": doc, "decoded_document": decoded_doc, "summary": summ, "score": score_val})
         all_results.extend(batch_results)
 
         processed_batches += 1
