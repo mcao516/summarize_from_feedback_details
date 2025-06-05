@@ -1,0 +1,60 @@
+You are an expert human evaluator specializing in text summarization.
+Your task is to meticulously compare two summaries, "Summary A" and "Summary B," generated from the same "Original Document."
+Your goal is to determine which summary is of higher quality overall.
+
+Please consider the following criteria in your evaluation:
+
+1.  **Accuracy & Faithfulness:**
+    *   Does the summary accurately represent the main points of the original document?
+    *   Does it avoid introducing new information or misinterpreting facts from the document (hallucinations)?
+2.  **Coverage & Comprehensiveness:**
+    *   Does the summary cover the most important information and key takeaways from the original document?
+    *   Are there any critical omissions of essential information?
+3.  **Conciseness & Succinctness:**
+    *   Is the summary brief and to the point, avoiding unnecessary jargon, redundancy, or overly verbose phrasing, while still capturing essential information?
+    *   Is it significantly shorter than the original document, as a good summary should be?
+4.  **Clarity & Readability:**
+    *   Is the summary well-written, grammatically correct, easy to understand, and fluent?
+    *   Is the language clear and precise?
+5.  **Coherence:**
+    *   Do the sentences in the summary flow logically? Does it make sense as a standalone piece of text?
+    *   Is there a logical structure to the summary?
+
+**Input:**
+
+**Original Document:**
+```
+{document_text}
+```
+
+**Summary A:**
+```
+{summary_a_text}
+```
+
+**Summary B:**
+```
+{summary_b_text}
+```
+
+**Instructions for your response:**
+
+1.  **Reasoning:**
+    *   First, briefly state your understanding of the main purpose or key points of the **Original Document**.
+    *   Then, provide a step-by-step comparative analysis of Summary A and Summary B based on the criteria listed above (Accuracy, Coverage, Conciseness, Clarity, Coherence).
+    *   For each criterion, explicitly compare A and B. For instance, "Regarding Accuracy, Summary A does X well, while Summary B struggles with Y..."
+    *   Point out specific strengths and weaknesses of each summary. You can reference parts of the summaries or the original document if helpful (e.g., "Summary A correctly captures the detail about X from paragraph 2 of the document, whereas Summary B omits this.").
+
+2.  **Overall Decision:**
+    *   After your detailed reasoning, clearly state which summary you believe is better overall and why, making a holistic judgment. If they are of very comparable quality, or if one excels in some areas while the other excels in others making a clear choice difficult, you can indicate that.
+
+**Output Format:**
+
+First, provide your detailed **Reasoning** as described above.
+Then, on a new line, write "**Overall Decision:**" followed by your overall assessment.
+Finally, on a separate, new line, output *only* one letter:
+    *   'A' if Summary A is better.
+    *   'B' if Summary B is better.
+    *   'C' if both summaries are of very similar quality (a tie), or if one is not definitively superior to the other across the most important criteria.
+
+Begin your evaluation now.
