@@ -6,15 +6,10 @@ from typing import Literal, Optional
 import json
 
 import numpy as np
-# import pandas as pd # Not strictly needed for this version
 import torch
 import torch.nn as nn
-# import torch.nn.functional as F # Not used directly in this version
 import tyro
-# from accelerate import Accelerator # REMOVED
-# from accelerate.state import AcceleratorState # REMOVED
-# from accelerate.utils import broadcast, gather_object # REMOVED
-from datasets import load_dataset # Dataset not strictly needed but can be useful
+from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
 from torch.utils.data import DataLoader
@@ -89,7 +84,6 @@ class ScalarModel(PreTrainedModel):
     def __init__(self, config: ScalarModelConfig):
         super().__init__(config)
         self.config = config
-        self.config.base_model = "/home/mila/c/caomeng/scratch/caden_shuyuan_share/sft_model_1"
         base_config_obj = AutoConfig.from_pretrained(config.base_model, **config.base_config_dict)
 
         self.lm_backbone = AutoModel.from_pretrained(
@@ -220,12 +214,11 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Setup logging and reproducibility
-    # local_seed = args.seed # No process index to add
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if device.type == 'cuda':
-        torch.cuda.manual_seed_all(args.seed) # For multi-GPU if used without accelerator (though this script is single-GPU focused now)
+        torch.cuda.manual_seed_all(args.seed)
     # torch.backends.cudnn.deterministic = True # Can slow down, optional
 
     console = Console(force_terminal=True)
@@ -289,7 +282,7 @@ if __name__ == "__main__":
     
     # Load and prepare dataset
     print(f"Loading dataset {args.query_dataset} split {args.dataset_split}...")
-    eval_dataset = load_dataset(args.query_dataset, split=args.dataset_split, cache_dir=".cache/huggingface/datasets")
+    eval_dataset = load_dataset(args.query_dataset, split=args.dataset_split)
     if "query_token" not in eval_dataset.column_names:
         raise ValueError(f"'query_token' column not found in dataset. Available columns: {eval_dataset.column_names}")
     eval_dataset = eval_dataset.with_format("torch", columns=["query_token"])
@@ -325,11 +318,11 @@ if __name__ == "__main__":
         batch_scores_list = None
         if reward_model:
             scores_tensor = get_score_from_reward_model(
-                reward_model, # Already on device
+                reward_model,
                 postprocessed_query_responses,
                 tokenizer,
                 context_length,
-                device # Pass device to scoring function
+                device,
             )
             batch_scores_list = scores_tensor.cpu().numpy().tolist()
 
