@@ -1,3 +1,4 @@
+import argparse
 import json
 import random
 import os
@@ -8,54 +9,7 @@ from openai import OpenAI
 import concurrent.futures
 import threading
 
-# --- Configuration ---
-MODEL1_JSON_PATH = "/home/mila/c/caomeng/summarize_from_feedback_details/analysis/outputs/tldr_test_reference.json"
-MODEL2_JSON_PATH = "/home/mila/c/caomeng/summarize_from_feedback_details/analysis/outputs/tldr_test_shap_span_20250603_023511.json"
-MODEL1_NAME = "Reference"
-MODEL2_NAME = "RLHF"
-NUM_EVAL_SAMPLES = 1000
-MAX_WORKERS = 30 # Number of threads for parallel processing
 
-# API Keys - Prefer environment variables
-GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
-# For OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Evaluator Choice: "GEMINI" or "OPENAI"
-EVALUATOR_MODEL_TYPE = "GEMINI"
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
-OPENAI_MODEL_NAME = "gpt-4.1-2025-04-14" # o4-mini-2025-04-16
-
-# API Call Settings
-API_RETRIES = 5
-API_DELAY_SECONDS = 0.1
-API_TEMPERATURE = 0.1
-API_MAX_OUTPUT_TOKENS = 2048
-
-
-# --- Initialize API Clients ---
-# Google Gemini
-if EVALUATOR_MODEL_TYPE == "GEMINI" and GOOGLE_API_KEY:
-    try:
-        gemini_model_client = genai.Client(api_key=GOOGLE_API_KEY) # User's original client initialization
-    except Exception as e:
-        print(f"Error initializing Gemini client: {e}")
-        gemini_model_client = None
-else:
-    gemini_model_client = None
-
-# OpenAI
-if EVALUATOR_MODEL_TYPE == "OPENAI" and OPENAI_API_KEY:
-    try:
-        openai_client_instance = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        print(f"Error initializing OpenAI client: {e}")
-        openai_client_instance = None
-else:
-    openai_client_instance = None
-
-
-# --- Helper Functions ---
 def load_json_dataset(file_path):
     """Loads a JSON dataset from the given file path."""
     try:
@@ -78,19 +32,19 @@ def load_json_dataset(file_path):
         return None
 
 
-def call_gemini_api(prompt_text, retries=API_RETRIES, delay=API_DELAY_SECONDS):
+def call_gemini_api(prompt_text, gemini_client, model_name, retries, delay, temperature, max_output_tokens):
     """Calls the Gemini API with retry logic."""
-    if not gemini_model_client:
+    if not gemini_client:
         print("Error: Gemini client not initialized. Check API Key or initialization.")
         return None
     for attempt in range(retries):
         try:
-            response = gemini_model_client.models.generate_content(
-                model=GEMINI_MODEL_NAME,
+            response = gemini_client.models.generate_content(
+                model=model_name,
                 contents=prompt_text,
                 config=types.GenerateContentConfig(
-                    max_output_tokens=API_MAX_OUTPUT_TOKENS,
-                    temperature=API_TEMPERATURE,
+                    max_output_tokens=max_output_tokens,
+                    temperature=temperature,
                 )
             )
             return response.text if hasattr(response, 'text') else str(response)
@@ -104,21 +58,21 @@ def call_gemini_api(prompt_text, retries=API_RETRIES, delay=API_DELAY_SECONDS):
                 return None
 
 
-def call_openai_api(prompt_text, retries=API_RETRIES, delay=API_DELAY_SECONDS):
+def call_openai_api(prompt_text, openai_client, model_name, retries, delay, temperature, max_output_tokens):
     """Calls the OpenAI API with retry logic."""
-    if not openai_client_instance:
+    if not openai_client:
         print("Error: OpenAI client not initialized. Check API Key or initialization.")
         return None
     for attempt in range(retries):
         try:
-            response = openai_client_instance.chat.completions.create(
-                model=OPENAI_MODEL_NAME,
+            response = openai_client.chat.completions.create(
+                model=model_name,
                 messages=[
                     {"role": "system", "content": "You are an expert evaluator of text summaries."},
                     {"role": "user", "content": prompt_text}
                 ],
-                max_tokens=API_MAX_OUTPUT_TOKENS,
-                temperature=API_TEMPERATURE
+                max_tokens=max_output_tokens,
+                temperature=temperature
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -158,7 +112,6 @@ def extract_decision(llm_response_text):
             if cleaned_line_upper.startswith("DECISION: C") or cleaned_line_upper == "C": return 'C'
 
             if line.startswith("**Overall Decision:**"): # Matches the prompt example
-                # Check for A, B, C directly after this, or in common phrases
                 decision_part = cleaned_line_upper.replace("**OVERALL DECISION:**", "").strip()
                 if decision_part == 'A': return 'A'
                 if decision_part == 'B': return 'B'
@@ -177,19 +130,17 @@ def extract_decision(llm_response_text):
 
 
 def _process_item_task(item_index, item_m1, item_m2, prompt_template,
-                       model1_name_const, model2_name_const, evaluator_type_const,
-                       shared_results_dict, shared_detailed_results_list, results_lock, total_items_count):
+                       model1_name_param, model2_name_param, # These come from args.model1_name, args.model2_name
+                       shared_results_dict, shared_detailed_results_list, results_lock,
+                       gemini_client_instance, openai_client_instance,
+                       args_config):
     """Processes a single item evaluation. Designed to be run in a thread."""
+    # Note: total_items_count removed as it was only for a print statement easily derived outside
     print(f"--- Evaluating item index {item_index} (Processing order may vary) ---")
 
     original_doc = item_m1['document']
     summary_m1_text = item_m1['summary']
     summary_m2_text = item_m2['summary']
-
-    # Ensure document for model2 is the same if a common 'id' or 'document' is expected
-    # For now, assuming item_m1['document'] is the reference. If item_m2 can have a different
-    # 'document' for the same index, this needs careful handling based on dataset structure.
-    # The current code implies they are paired by index and should share the document.
 
     assigned_summary_a_text = ""
     assigned_summary_b_text = ""
@@ -200,13 +151,13 @@ def _process_item_task(item_index, item_m1, item_m2, prompt_template,
     if is_m1_a:
         assigned_summary_a_text = summary_m1_text
         assigned_summary_b_text = summary_m2_text
-        summary_a_origin_model = model1_name_const
-        summary_b_origin_model = model2_name_const
+        summary_a_origin_model = model1_name_param
+        summary_b_origin_model = model2_name_param
     else:
         assigned_summary_a_text = summary_m2_text
         assigned_summary_b_text = summary_m1_text
-        summary_a_origin_model = model2_name_const
-        summary_b_origin_model = model1_name_const
+        summary_a_origin_model = model2_name_param
+        summary_b_origin_model = model1_name_param
 
     current_prompt = prompt_template.format(
         document_text=original_doc,
@@ -215,17 +166,31 @@ def _process_item_task(item_index, item_m1, item_m2, prompt_template,
     )
 
     llm_response = None
-    # print(f"Thread {threading.get_ident()}: Calling {evaluator_type_const} API for item {item_index}...") # Optional: for thread debugging
-    if evaluator_type_const == "GEMINI":
-        llm_response = call_gemini_api(current_prompt) # API_DELAY_SECONDS is for retries inside this
-    elif evaluator_type_const == "OPENAI":
-        llm_response = call_openai_api(current_prompt) # API_DELAY_SECONDS is for retries inside this
+    if args_config.evaluator_model_type == "GEMINI":
+        llm_response = call_gemini_api(
+            current_prompt,
+            gemini_client_instance,
+            args_config.gemini_model_name,
+            args_config.api_retries,
+            args_config.api_delay_seconds,
+            args_config.api_temperature,
+            args_config.api_max_output_tokens
+        )
+    elif args_config.evaluator_model_type == "OPENAI":
+        llm_response = call_openai_api(
+            current_prompt,
+            openai_client_instance,
+            args_config.openai_model_name,
+            args_config.api_retries,
+            args_config.api_delay_seconds,
+            args_config.api_temperature,
+            args_config.api_max_output_tokens
+        )
     else:
-        print(f"Error: Unknown EVALUATOR_MODEL_TYPE: {evaluator_type_const}")
+        print(f"Error: Unknown EVALUATOR_MODEL_TYPE: {args_config.evaluator_model_type}")
         with results_lock:
             shared_results_dict["Errors/NoDecision"] += 1
-        # No detailed result to append here other than error, or could append a minimal one
-        return # Exit task for this item
+        return
 
     current_result_detail = {
         "item_index": item_index,
@@ -234,7 +199,7 @@ def _process_item_task(item_index, item_m1, item_m2, prompt_template,
         "summary_A_origin": summary_a_origin_model,
         "summary_B_text": assigned_summary_b_text,
         "summary_B_origin": summary_b_origin_model,
-        "llm_evaluator": evaluator_type_const,
+        "llm_evaluator": args_config.evaluator_model_type,
         "llm_response_raw": llm_response,
         "decision_extracted": None,
         "winner": None
@@ -248,45 +213,40 @@ def _process_item_task(item_index, item_m1, item_m2, prompt_template,
     else:
         decision = extract_decision(llm_response)
         current_result_detail["decision_extracted"] = decision
-        # print(f"Thread {threading.get_ident()}: LLM Decision for item {item_index} Raw: '{decision}' (A={summary_a_origin_model}, B={summary_b_origin_model})")
 
         with results_lock:
             if decision == 'A':
                 winner = summary_a_origin_model
                 shared_results_dict[winner] += 1
                 current_result_detail["winner"] = winner
-                # print(f"LLM preferred {winner} (assigned to A) for item {item_index}")
             elif decision == 'B':
                 winner = summary_b_origin_model
                 shared_results_dict[winner] += 1
                 current_result_detail["winner"] = winner
-                # print(f"LLM preferred {winner} (assigned to B) for item {item_index}")
             elif decision == 'C':
                 shared_results_dict["Tie/Inconclusive"] += 1
                 current_result_detail["winner"] = "Tie/Inconclusive"
-                # print(f"LLM judged item {item_index} as a Tie/Inconclusive.")
             else:
                 shared_results_dict["Errors/NoDecision"] += 1
                 current_result_detail["winner"] = "Error/NoDecision_Extraction"
-                # print(f"Could not determine a clear decision for item {item_index} from LLM response.")
 
     with results_lock:
         shared_detailed_results_list.append(current_result_detail)
 
-    time.sleep(API_DELAY_SECONDS) # Small delay after processing each item, per thread
+    time.sleep(args_config.api_delay_seconds) # Small delay after processing each item, per thread
 
 
-def run_evaluation():
+def run_evaluation(args, gemini_model_client, openai_client_instance):
     print("Loading datasets...")
-    data_model1_full = load_json_dataset(MODEL1_JSON_PATH)
-    data_model2_full = load_json_dataset(MODEL2_JSON_PATH)
+    data_model1_full = load_json_dataset(args.model1_json_path)
+    data_model2_full = load_json_dataset(args.model2_json_path)
 
     if not data_model1_full or not data_model2_full:
         print("Failed to load one or both datasets. Exiting.")
         return
 
     min_len = min(len(data_model1_full), len(data_model2_full))
-    num_samples_to_run = min(min_len, NUM_EVAL_SAMPLES)
+    num_samples_to_run = min(min_len, args.num_eval_samples)
 
     if len(data_model1_full) != len(data_model2_full):
         print(f"Warning: Datasets have different lengths ({len(data_model1_full)} vs {len(data_model2_full)}). Using {num_samples_to_run} common samples.")
@@ -294,25 +254,22 @@ def run_evaluation():
     data_model1 = data_model1_full[:num_samples_to_run]
     data_model2 = data_model2_full[:num_samples_to_run]
 
-    if not data_model1: # handles num_samples_to_run being 0
+    if not data_model1:
         print("No samples to evaluate based on NUM_EVAL_SAMPLES or dataset lengths.")
         return
 
     print(f"Successfully loaded {len(data_model1)} items for comparison.")
 
-    prompt_template_path = "prompt_template.txt"
-    if not os.path.exists(prompt_template_path):
-        print(f"Error: Prompt template file not found at {prompt_template_path}")
-        # (Example prompt content printout omitted for brevity, it's in the original)
+    if not os.path.exists(args.prompt_template_path):
+        print(f"Error: Prompt template file not found at {args.prompt_template_path}")
         return
 
-    with open(prompt_template_path, "r", encoding='utf-8') as rf:
+    with open(args.prompt_template_path, "r", encoding='utf-8') as rf:
         prompt_template_content = rf.read()
 
-    # Shared resources for threads
     results_summary = {
-        MODEL1_NAME: 0,
-        MODEL2_NAME: 0,
+        args.model1_name: 0,
+        args.model2_name: 0,
         "Tie/Inconclusive": 0,
         "Errors/NoDecision": 0
     }
@@ -320,62 +277,55 @@ def run_evaluation():
     processing_lock = threading.Lock()
 
     total_items_to_process = len(data_model1)
-    print(f"\nStarting evaluation of {total_items_to_process} items using up to {MAX_WORKERS} workers...")
+    print(f"\nStarting evaluation of {total_items_to_process} items using up to {args.max_workers} workers...")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = []
         for i in range(total_items_to_process):
             item_m1 = data_model1[i]
-            item_m2 = data_model2[i] # Assuming documents are paired correctly by index
-            
-            # Ensure documents match if that's an assumption.
-            # If item_m1['document'] could differ from item_m2['document'] for the same conceptual item,
-            # then a matching key (e.g., 'id') would be needed to pair them from the full datasets.
-            # The current code structure implies data_model1[i] and data_model2[i] form a pair.
+            item_m2 = data_model2[i]
+
             if item_m1.get('document') != item_m2.get('document'):
-                print("Documents are NOT the same!")
-                pass
+                # This was a pass before, making it a warning. Consider if this should be an error.
+                print(f"Warning: Documents for item index {i} are different. Proceeding with m1's document as primary.")
 
             futures.append(executor.submit(
                 _process_item_task,
-                    i,  # item_index
-                    item_m1,
-                    item_m2,
-                    prompt_template_content,
-                    MODEL1_NAME,
-                    MODEL2_NAME,
-                    EVALUATOR_MODEL_TYPE,
-                    results_summary,
-                    detailed_results_list,
-                    processing_lock,
-                    total_items_to_process
+                i,
+                item_m1,
+                item_m2,
+                prompt_template_content,
+                args.model1_name, # Pass model name from args
+                args.model2_name, # Pass model name from args
+                results_summary,
+                detailed_results_list,
+                processing_lock,
+                gemini_model_client, # Pass initialized Gemini client
+                openai_client_instance, # Pass initialized OpenAI client
+                args  # Pass the full args object
             ))
 
-        # Wait for all futures to complete
         for future in concurrent.futures.as_completed(futures):
             try:
-                future.result()  # To raise exceptions if any occurred in the thread
+                future.result()
             except Exception as exc:
                 print(f'An item processing generated an exception: {exc}')
 
-    # Sort detailed_results by item_index for consistent output if needed
     detailed_results_list.sort(key=lambda x: x["item_index"])
 
-    # Print final results
     print("\n--- Evaluation Complete ---")
     print("Final Results:")
     for model_name_key, count in results_summary.items():
         print(f"{model_name_key}: {count}")
 
-    total_compared_for_wins = results_summary[MODEL1_NAME] + results_summary[MODEL2_NAME]
+    total_compared_for_wins = results_summary[args.model1_name] + results_summary[args.model2_name]
     if total_compared_for_wins > 0:
-        print(f"\nWin percentage for {MODEL1_NAME} (vs {MODEL2_NAME}, excluding ties & errors): {results_summary[MODEL1_NAME] / total_compared_for_wins * 100:.2f}%")
-        print(f"Win percentage for {MODEL2_NAME} (vs {MODEL1_NAME}, excluding ties & errors): {results_summary[MODEL2_NAME] / total_compared_for_wins * 100:.2f}%")
+        print(f"\nWin percentage for {args.model1_name} (vs {args.model2_name}, excluding ties & errors): {results_summary[args.model1_name] / total_compared_for_wins * 100:.2f}%")
+        print(f"Win percentage for {args.model2_name} (vs {args.model1_name}, excluding ties & errors): {results_summary[args.model2_name] / total_compared_for_wins * 100:.2f}%")
     else:
         print("\nNo conclusive wins to calculate percentages.")
-    
-    # Save detailed results (optional, uncomment if needed)
-    results_output_filename = f"evaluation_results_{EVALUATOR_MODEL_TYPE.lower()}_{MODEL1_NAME}_vs_{MODEL2_NAME}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+
+    results_output_filename = f"evaluation_results_{args.evaluator_model_type.lower()}_{args.model1_name}_vs_{args.model2_name}_{time.strftime('%Y%m%d_%H%M%S')}.json"
     try:
         with open(results_output_filename, 'w', encoding='utf-8') as f_out:
             json.dump(detailed_results_list, f_out, indent=2)
@@ -383,7 +333,7 @@ def run_evaluation():
     except IOError as e:
         print(f"Error saving detailed results to {results_output_filename}: {e}")
 
-    summary_stats_filename = f"evaluation_summary_{EVALUATOR_MODEL_TYPE.lower()}_{MODEL1_NAME}_vs_{MODEL2_NAME}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    summary_stats_filename = f"evaluation_summary_{args.evaluator_model_type.lower()}_{args.model1_name}_vs_{args.model2_name}_{time.strftime('%Y%m%d_%H%M%S')}.json"
     try:
         with open(summary_stats_filename, 'w', encoding='utf-8') as f_out:
             json.dump(results_summary, f_out, indent=2)
@@ -393,24 +343,72 @@ def run_evaluation():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run side-by-side LLM evaluation of summaries.")
+    
+    # File and Model Name Arguments
+    parser.add_argument("--model1_json_path", type=str, required=True, help="Path to the JSON file for Model 1's summaries.")
+    parser.add_argument("--model2_json_path", type=str, required=True, help="Path to the JSON file for Model 2's summaries.")
+    parser.add_argument("--model1_name", type=str, default="Model1", help="Name for Model 1.")
+    parser.add_argument("--model2_name", type=str, default="Model2", help="Name for Model 2.")
+    parser.add_argument("--prompt_template_path", type=str, default="prompt_template.txt", help="Path to the prompt template file.")
+
+    # Evaluation Control Arguments
+    parser.add_argument("--num_eval_samples", type=int, default=100, help="Number of samples to evaluate.")
+    parser.add_argument("--max_workers", type=int, default=5, help="Number of threads for parallel processing.")
+
+    # API Key Arguments (default to environment variables)
+    parser.add_argument("--google_api_key", type=str, default=os.getenv("GEMINI_API_KEY"), help="Google API Key. Defaults to GEMINI_API_KEY environment variable.")
+    parser.add_argument("--openai_api_key", type=str, default=os.getenv("OPENAI_API_KEY"), help="OpenAI API Key. Defaults to OPENAI_API_KEY environment variable.")
+
+    # Evaluator Model Choice Arguments
+    parser.add_argument("--evaluator_model_type", type=str, choices=["GEMINI", "OPENAI"], default="GEMINI", help="Evaluator LLM type.")
+    parser.add_argument("--gemini_model_name", type=str, default="gemini-1.5-flash", help="Specific Gemini model to use for evaluation.") # Updated default
+    parser.add_argument("--openai_model_name", type=str, default="gpt-4o-mini", help="Specific OpenAI model to use for evaluation.") # Updated default
+
+    # API Call Setting Arguments
+    parser.add_argument("--api_retries", type=int, default=5, help="Number of retries for API calls.")
+    parser.add_argument("--api_delay_seconds", type=float, default=0.1, help="Delay in seconds between retries and after each item processing.")
+    parser.add_argument("--api_temperature", type=float, default=0.1, help="Temperature for LLM generation.")
+    parser.add_argument("--api_max_output_tokens", type=int, default=2048, help="Max output tokens for LLM generation.")
+
+    args = parser.parse_args()
+
+    # Initialize API Clients based on parsed arguments
+    gemini_client_instance_main = None
+    openai_client_instance_main = None
+
+    if args.evaluator_model_type == "GEMINI":
+        if not args.google_api_key:
+            print("Error: Gemini evaluator selected, but Google API Key is not provided via argument or GEMINI_API_KEY env var. Exiting.")
+            exit(1)
+        try:
+            gemini_client_instance_main = genai.Client(api_key=args.google_api_key)
+            print("Gemini client initialized.")
+        except Exception as e:
+            print(f"Error initializing Gemini client: {e}")
+            gemini_client_instance_main = None
+
+    if args.evaluator_model_type == "OPENAI":
+        if not args.openai_api_key:
+            print("Error: OpenAI evaluator selected, but OpenAI API Key is not provided via argument or OPENAI_API_KEY env var. Exiting.")
+            exit(1)
+        try:
+            openai_client_instance_main = OpenAI(api_key=args.openai_api_key)
+            print("OpenAI client initialized.")
+        except Exception as e:
+            print(f"Error initializing OpenAI client: {e}")
+            openai_client_instance_main = None
+
+    # Validation for client initialization
     valid_config = True
-    if EVALUATOR_MODEL_TYPE == "GEMINI":
-        if not GOOGLE_API_KEY:
-            print("Error: Gemini evaluator selected, but GOOGLE_API_KEY is not configured. Exiting.")
-            valid_config = False
-        if not gemini_model_client:
-            print("Error: Gemini client failed to initialize. Exiting.")
-            valid_config = False
-    elif EVALUATOR_MODEL_TYPE == "OPENAI":
-        if not OPENAI_API_KEY:
-            print("Error: OpenAI evaluator selected, but OPENAI_API_KEY is not configured. Exiting.")
-            valid_config = False
-        if not openai_client_instance:
-            print("Error: OpenAI client failed to initialize. Exiting.")
-            valid_config = False
-    else:
-        print(f"Error: Unknown EVALUATOR_MODEL_TYPE: {EVALUATOR_MODEL_TYPE}. Choose 'GEMINI' or 'OPENAI'.")
+    if args.evaluator_model_type == "GEMINI" and not gemini_client_instance_main:
+        print("Error: Gemini client failed to initialize. Exiting.")
+        valid_config = False
+    elif args.evaluator_model_type == "OPENAI" and not openai_client_instance_main:
+        print("Error: OpenAI client failed to initialize. Exiting.")
         valid_config = False
     
     if valid_config:
-        run_evaluation()
+        run_evaluation(args, gemini_client_instance_main, openai_client_instance_main)
+    else:
+        print("Configuration or client initialization failed. Exiting.")
